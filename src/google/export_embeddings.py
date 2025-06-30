@@ -163,7 +163,7 @@ if __name__ == "__main__":
     parser.add_argument("--gcs_bucket", type=str, default='geovibes', help="The GCS bucket to export the final GeoJSON file to.")
     parser.add_argument("--gcs_prefix", type=str, default="embeddings/google_satellite_v1", help="Base GCS prefix/folder within the bucket.")
     parser.add_argument("--gee_asset_path", type=str, default='projects/demeterlabs-gee/assets/tiles', help="GEE asset path for tile assets (e.g., 'projects/user/assets/tiles').")
-    parser.add_argument("--tilesize", type=int, default=25, help="Tile size in pixels used to construct asset name.")
+    parser.add_argument("--tilesize", type=int, default=100, help="Tile size in pixels used to construct asset name.")
     parser.add_argument("--overlap", type=int, default=0, help="Overlap in pixels used to construct asset name.")
     parser.add_argument("--resolution", type=float, default=10.0, help="Resolution in meters per pixel used to construct asset name.")
 

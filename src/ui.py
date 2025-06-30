@@ -9,15 +9,18 @@ import duckdb
 import ee
 import geopandas as gpd
 import ipyleaflet as ipyl
-from ipyleaflet import Map, DrawControl
+from ipyleaflet import Map, DrawControl, Heatmap
 from IPython.display import display
-from ipywidgets import Button, VBox, HBox, IntSlider, Label, Layout, HTML, ToggleButtons, Accordion, FileUpload, Output
+from ipywidgets import Button, VBox, HBox, IntSlider, Label, Layout, HTML, ToggleButtons, Accordion, FileUpload, Output, Checkbox
 import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
 import shapely
 from shapely.geometry import Point
 import webbrowser
+from sklearn.linear_model import LogisticRegression
+from sklearn.preprocessing import StandardScaler
+from scipy.stats import rankdata
 
 from .ee_tools import get_s2_rgb_median, get_s2_ndvi_median, get_s2_ndwi_median, get_ee_image_url, initialize_ee_with_credentials
 from .ui_config import UIConstants, BasemapConfig, GeoVibesConfig, DatabaseConstants, LayerStyles
@@ -165,9 +168,21 @@ class GeoVibes:
         self.detections_with_embeddings = None
         self.current_operation = None  # Track current operation for status display
         
+        # Linear classifier state
+        self.classifier = None
+        self.scaler = None
+        self.predictions_gdf = None
+        self.classifier_trained = False
+        self.show_heatmap = False
+        self.normalize_colors = True
+        self.highlight_training_points = True
+
+        
         # Build UI
         self.side_panel, self.ui_widgets = self._build_side_panel()
-        
+        self.heatmap_toggle.value = False
+        self.normalize_heatmap.value = True
+        self.highlight_training.value = True
         # Add layers to map
         self._add_map_layers()
         
@@ -177,20 +192,8 @@ class GeoVibes:
         # Wire events
         self._wire_events()
         
-        # Add legend
-        self.legend = HTML(value=f"""
-            <div style='background: white; padding: 5px; border-radius: 5px; opacity: 0.8; font-size: 12px;'>
-                <div><strong>Labels:</strong> 
-                    <span style='color: {UIConstants.POS_COLOR}; font-weight: bold;'>🔵 Positive</span> | 
-                    <span style='color: {UIConstants.NEG_COLOR}; font-weight: bold;'>🟠 Negative</span>
-                </div>
-                <div style='margin-top: 3px;'><strong>Search Results:</strong> 
-                    <span style='color: #00ff00; font-weight: bold;'>🟢 Most Similar</span> → 
-                    <span style='color: #ffff00; font-weight: bold;'>🟡 Medium</span> → 
-                    <span style='color: #ff4444; font-weight: bold;'>🔴 Least Similar</span>
-                </div>
-            </div>
-        """)
+        # Add legend (will be updated dynamically based on coloring mode)
+        self._update_legend()
         
         # Add status bar
         self.status_bar = HTML(value="Ready")
@@ -286,10 +289,46 @@ class GeoVibes:
             tooltip='Clear all labels and search results'
         )
         
+        # --- Linear Classifier section ---
+        self.classify_btn = Button(
+            description='🤖 Classify All',
+            layout=Layout(width='100%', height=UIConstants.BUTTON_HEIGHT),
+            button_style='warning',  # Orange to distinguish from search
+            tooltip='Train linear classifier on labels and predict all points'
+        )
+        
+        self.heatmap_toggle = Checkbox(
+            value=False,
+            description='Show Heatmap',
+            layout=Layout(width='100%'),
+            tooltip='Toggle confidence heatmap layer visibility'
+        )
+        
+        self.normalize_heatmap = Checkbox(
+            value=True,
+            description='Percentile Colors',
+            layout=Layout(width='100%'),
+            tooltip='Use percentile-based coloring (top 20% = darkest) vs absolute confidence values'
+        )
+        
+        self.highlight_training = Checkbox(
+            value=True,
+            description='Highlight Training',
+            layout=Layout(width='100%'),
+            tooltip='Show training points with maximum confidence for visualization'
+        )
+        
+        self.classifier_output = Output(layout=Layout(width='100%', height='150px', display='none'))
+        
         search_section = VBox([
             self.search_btn,
             self.neighbors_slider,
             self.histogram_output,
+            self.classify_btn,
+            self.heatmap_toggle,
+            self.normalize_heatmap,
+            self.highlight_training,
+            self.classifier_output,
             self.reset_btn
         ], layout=Layout(padding='5px', margin='0 0 10px 0'))
         
@@ -399,6 +438,11 @@ class GeoVibes:
             'selection_mode': self.selection_mode,
             'neighbors_slider': self.neighbors_slider,
             'histogram_output': self.histogram_output,
+            'classify_btn': self.classify_btn,
+            'heatmap_toggle': self.heatmap_toggle,
+            'normalize_heatmap': self.normalize_heatmap,
+            'highlight_training': self.highlight_training,
+            'classifier_output': self.classifier_output,
             'basemap_buttons': self.basemap_buttons,
             'save_btn': self.save_btn,
             'load_btn': self.load_btn,
@@ -471,6 +515,15 @@ class GeoVibes:
         )
         self.map.add_layer(self.points)
         
+        # Heatmap layer for classifier confidence scores
+        self.heatmap_layer = Heatmap(
+            locations=[],  # Empty initially, will be populated with [lat, lon, intensity] points
+            radius=25,
+            blur=10,
+            max_intensity=1.0,
+            gradient={0.0: 'navy', 0.2: 'blue', 0.4: 'cyan', 0.6: 'lime', 0.8: 'yellow', 1.0: 'red'}
+        )
+        self.map.add_layer(self.heatmap_layer)
 
     def _setup_draw_control(self):
         """Set up the draw control for lasso selection."""
@@ -519,6 +572,12 @@ class GeoVibes:
         self.load_btn.on_click(self._on_load_click)
         self.file_upload.observe(self._on_file_upload, names=['value'])
         self.google_maps_btn.on_click(self._on_google_maps_click)
+        
+        # Classifier controls
+        self.classify_btn.on_click(self.classify_all)
+        self.heatmap_toggle.observe(self._on_heatmap_toggle, 'value')
+        self.normalize_heatmap.observe(self._on_normalize_heatmap, 'value')
+        self.highlight_training.observe(self._on_highlight_training, 'value')
         
         # Map interactions
         self.map.on_interaction(self._on_map_interaction)
@@ -634,6 +693,27 @@ class GeoVibes:
         self.lasso_mode = (change['new'] == 'polygon')
         self._update_status()
 
+    def _on_heatmap_toggle(self, change):
+        """Handle heatmap visibility toggle."""
+        self.show_heatmap = change['new']
+        if self.show_heatmap and self.predictions_gdf is not None:
+            self._update_heatmap_layer()
+        else:
+            # Hide heatmap by clearing the locations
+            self.heatmap_layer.locations = []
+
+    def _on_normalize_heatmap(self, change):
+        """Handle heatmap normalization toggle."""
+        self.normalize_colors = change['new']
+        self._update_legend()  # Update legend to reflect new mode
+        if self.show_heatmap and self.predictions_gdf is not None:
+            self._update_heatmap_layer()
+
+    def _on_highlight_training(self, change):
+        """Handle highlight training toggle."""
+        self.highlight_training_points = change['new']
+        if self.show_heatmap and self.predictions_gdf is not None:
+            self._update_heatmap_layer()
 
     def handle_draw(self, target, action, geo_json):
         """Handle polygon drawing with chunked embedding fetching."""
@@ -785,12 +865,25 @@ class GeoVibes:
         # Clear detections
         self.detections_with_embeddings = None
         
+        # Clear classifier state
+        self.classifier = None
+        self.scaler = None
+        self.predictions_gdf = None
+        self.classifier_trained = False
+        self.show_heatmap = False
+        self.normalize_colors = True
+        self.highlight_training_points = True
+        self.heatmap_toggle.value = False
+        self.normalize_heatmap.value = True
+        self.highlight_training.value = True
+        
         # Clear all map layers
         empty_geojson = {"type": "FeatureCollection", "features": []}
         self.pos_layer.data = empty_geojson
         self.neg_layer.data = empty_geojson
         self.erase_layer.data = empty_geojson
         self.points.data = empty_geojson
+        self.heatmap_layer.locations = []
         
         # Hide histogram component
         self.histogram_output.layout.display = 'none'
@@ -798,6 +891,11 @@ class GeoVibes:
         # Clear histogram output
         with self.histogram_output:
             self.histogram_output.clear_output()
+        
+        # Hide and clear classifier output
+        self.classifier_output.layout.display = 'none'
+        with self.classifier_output:
+            self.classifier_output.clear_output()
         
         # Clear operation status
         self._clear_operation_status()
@@ -879,7 +977,8 @@ class GeoVibes:
         total_requested = n_neighbors + extra_results
         
         # Use dynamic query with detected embedding dimension
-        sql = DatabaseConstants.get_similarity_search_light_query(self.embedding_dim)
+        # sql = DatabaseConstants.get_similarity_search_light_query(self.embedding_dim)
+        sql = DatabaseConstants.get_similarity_search_query(self.embedding_dim)
         query_params = [query_vec, total_requested]
         
         # Show search progress in status bar
@@ -1461,6 +1560,342 @@ class GeoVibes:
             plt.tight_layout()
             plt.show()
 
+    def classify_all(self, b):
+        """Train linear classifier on labeled data and apply to all embeddings."""
+        # Check if we have sufficient labeled data
+        if len(self.pos_ids) == 0:
+            if self.verbose:
+                print("⚠️ No positive labels found. Please add some positive labels first.")
+            return
+        
+        if len(self.pos_ids) + len(self.neg_ids) < 3:
+            if self.verbose:
+                print("⚠️ Need at least 3 labeled points (positive + negative) to train classifier.")
+            return
+        
+        self._show_operation_status("🤖 Training linear classifier...")
+        if self.verbose:
+            print("🤖 Training linear classifier on labeled data...")
+        
+        try:
+            # Fetch embeddings for all labeled points
+            all_labeled_ids = self.pos_ids + self.neg_ids
+            self._fetch_embeddings(all_labeled_ids)
+            
+            # Prepare training data
+            X_train = []
+            y_train = []
+            
+            # Add positive examples
+            for pid in self.pos_ids:
+                if pid in self.cached_embeddings:
+                    X_train.append(self.cached_embeddings[pid])
+                    y_train.append(1)
+            
+            # Add negative examples
+            for nid in self.neg_ids:
+                if nid in self.cached_embeddings:
+                    X_train.append(self.cached_embeddings[nid])
+                    y_train.append(0)
+            
+            if len(X_train) < 2:
+                if self.verbose:
+                    print("⚠️ Insufficient training data after fetching embeddings.")
+                return
+            
+            X_train = np.array(X_train)
+            y_train = np.array(y_train)
+            
+            # Train classifier
+            # self.scaler = StandardScaler()
+            # X_train_scaled = self.scaler.fit_transform(X_train)
+            
+            self.classifier = LogisticRegression(random_state=42, max_iter=1000)
+            self.classifier.fit(X_train, y_train)
+            
+            # Calculate training accuracy
+            train_score = self.classifier.score(X_train, y_train)
+            
+            self._show_operation_status(f"✅ Classifier trained (accuracy: {train_score:.2f})")
+            if self.verbose:
+                print(f"✅ Classifier trained successfully!")
+                print(f"   Training accuracy: {train_score:.2f}")
+                print(f"   Training data: {len(self.pos_ids)} positive, {len(self.neg_ids)} negative")
+            
+            # Show classifier info
+            with self.classifier_output:
+                self.classifier_output.clear_output(wait=True)
+                print(f"🤖 Linear Classifier Summary:")
+                print(f"   Training accuracy: {train_score:.2f}")
+                print(f"   Positive examples: {len(self.pos_ids)}")
+                print(f"   Negative examples: {len(self.neg_ids)}")
+                print(f"   Feature dimension: {X_train.shape[1]}")
+            
+            self.classifier_output.layout.display = 'flex'
+            self.classifier_trained = True
+            
+            # Apply classifier to all points
+            self._apply_classifier_to_all()
+            
+        except Exception as e:
+            self._show_operation_status(f"❌ Classifier training failed")
+            if self.verbose:
+                print(f"❌ Error training classifier: {str(e)}")
+
+    def _apply_classifier_to_all(self, chunk_size=5000):
+        """Apply trained classifier to all embeddings in the database."""
+        if not self.classifier_trained or self.classifier is None:
+            return
+        
+        self._show_operation_status("🔄 Applying classifier to all points...")
+        if self.verbose:
+            print("🔄 Applying classifier to all points in database...")
+        
+        try:
+            # Get total count for progress tracking
+            count_query = "SELECT COUNT(*) FROM geo_embeddings"
+            total_points = self.duckdb_connection.execute(count_query).fetchone()[0]
+            
+            if self.verbose:
+                print(f"   Processing {total_points} points...")
+            
+            # Process in chunks to avoid memory issues
+            predictions_list = []
+            confidence_list = []
+            geometries_list = []
+            ids_list = []
+            
+            offset = 0
+            processed = 0
+            
+            while offset < total_points:
+                # Show progress
+                progress_pct = (offset / total_points) * 100
+                self._show_operation_status(f"🔄 Classifying... {progress_pct:.0f}% ({offset}/{total_points})")
+                
+                # Fetch chunk of data
+                chunk_query = f"""
+                SELECT id, embedding, ST_AsGeoJSON(geometry) as geometry_json, ST_AsText(geometry) as geometry_wkt
+                FROM geo_embeddings 
+                LIMIT {chunk_size} OFFSET {offset}
+                """
+                
+                arrow_table = self.duckdb_connection.execute(chunk_query).fetch_arrow_table()
+                chunk_df = arrow_table.to_pandas()
+                
+                if chunk_df.empty:
+                    break
+                
+                # Extract embeddings
+                embeddings = np.array([np.array(emb) for emb in chunk_df['embedding']])
+                
+                # Scale embeddings
+                # embeddings_scaled = self.scaler.transform(embeddings)
+                
+                # Get predictions and confidence scores
+                predictions = self.classifier.predict(embeddings)
+                confidence_scores = self.classifier.predict_proba(embeddings)[:, 1]  # Probability of positive class
+                
+                # Store results
+                predictions_list.extend(predictions)
+                confidence_list.extend(confidence_scores)
+                ids_list.extend(chunk_df['id'].astype(str).tolist())
+                
+                # Create geometries from WKT
+                geometries = [shapely.wkt.loads(wkt) if wkt else None for wkt in chunk_df['geometry_wkt']]
+                geometries_list.extend(geometries)
+                
+                offset += len(chunk_df)
+                processed += len(chunk_df)
+                
+                # Update progress more frequently for large datasets
+                if processed % 10000 == 0 or processed >= total_points:
+                    progress_pct = (processed / total_points) * 100
+                    self._show_operation_status(f"🔄 Classified {processed}/{total_points} points ({progress_pct:.0f}%)")
+            
+            # Create GeoDataFrame with predictions
+            self.predictions_gdf = gpd.GeoDataFrame({
+                'id': ids_list,
+                'prediction': predictions_list,
+                'confidence': confidence_list,
+                'geometry': geometries_list
+            })
+            
+            # Update heatmap if enabled
+            if self.show_heatmap:
+                self._update_heatmap_layer()
+            
+            # Show completion status
+            n_positive = np.sum(predictions_list)
+            n_negative = len(predictions_list) - n_positive
+            avg_confidence = np.mean(confidence_list)
+            
+            self._show_operation_status(f"✅ Classified {processed} points ({n_positive} positive, {n_negative} negative)")
+            
+            if self.verbose:
+                print(f"✅ Classification complete!")
+                print(f"   Total points: {processed}")
+                print(f"   Predicted positive: {n_positive}")
+                print(f"   Predicted negative: {n_negative}")
+                print(f"   Average confidence: {avg_confidence:.3f}")
+            
+            # Update classifier output with results
+            with self.classifier_output:
+                self.classifier_output.clear_output(wait=True)
+                print(f"🤖 Classification Results:")
+                print(f"   Total points classified: {processed}")
+                print(f"   Predicted positive: {n_positive}")
+                print(f"   Predicted negative: {n_negative}")
+                print(f"   Average confidence: {avg_confidence:.3f}")
+                
+                # Show confidence distribution statistics
+                conf_min = np.min(confidence_list)
+                conf_max = np.max(confidence_list)
+                conf_25 = np.percentile(confidence_list, 25)
+                conf_75 = np.percentile(confidence_list, 75)
+                print(f"   Confidence range: {conf_min:.3f} - {conf_max:.3f}")
+                print(f"   Confidence 25%-75%: {conf_25:.3f} - {conf_75:.3f}")
+                
+                # Check confidence for training points
+                if self.pos_ids or self.neg_ids:
+                    train_confidences = []
+                    for train_id in (self.pos_ids + self.neg_ids):
+                        idx = self.predictions_gdf[self.predictions_gdf['id'] == train_id].index
+                        if len(idx) > 0:
+                            train_conf = self.predictions_gdf.loc[idx[0], 'confidence']
+                            train_confidences.append(train_conf)
+                    
+                    if train_confidences:
+                        avg_train_conf = np.mean(train_confidences)
+                        print(f"   Training points avg confidence: {avg_train_conf:.3f}")
+                
+                # Generate confidence histogram
+                plt.figure(figsize=(8, 3))
+                plt.hist(confidence_list, bins=30, alpha=0.7, color='lightblue', edgecolor='black')
+                plt.xlabel('Confidence Score', fontsize=12)
+                plt.ylabel('Count', fontsize=12)
+                plt.title(f'Confidence Distribution ({len(confidence_list)} points)', fontsize=12)
+                plt.grid(True, alpha=0.3)
+                plt.tight_layout()
+                plt.show()
+                
+                print(f"   Toggle 'Show Heatmap' to visualize smooth confidence map")
+            
+        except Exception as e:
+            self._show_operation_status(f"❌ Classification failed")
+            if self.verbose:
+                print(f"❌ Error applying classifier: {str(e)}")
+
+    def _update_heatmap_layer(self):
+        """Update the heatmap layer with confidence-based smooth heatmap."""
+        if self.predictions_gdf is None or len(self.predictions_gdf) == 0:
+            return
+        
+        if self.verbose:
+            print("🎨 Updating smooth heatmap layer...")
+        
+        # Sample points for performance if dataset is very large
+        sample_size = 15000  # Increased sample size for smoother heatmap
+        if len(self.predictions_gdf) > sample_size:
+            display_df = self.predictions_gdf.sample(n=sample_size, random_state=42)
+            if self.verbose:
+                print(f"   Sampling {sample_size} points for heatmap display")
+        else:
+            display_df = self.predictions_gdf
+        
+        # Get confidence values for normalization
+        confidences = display_df['confidence'].values.copy()  # Make a copy so we can modify it
+        
+        # Highlight training points with maximum confidence if enabled
+        if self.highlight_training_points and (self.pos_ids or self.neg_ids):
+            training_ids = set(str(tid) for tid in (self.pos_ids + self.neg_ids))
+            for idx, (df_idx, row) in enumerate(display_df.iterrows()):
+                if str(row['id']) in training_ids:
+                    # Positive labels get confidence 1.0, negative labels get confidence 0.0
+                    if str(row['id']) in [str(pid) for pid in self.pos_ids]:
+                        confidences[idx] = 1.0
+                    else:  # Negative labels
+                        confidences[idx] = 0.0
+            
+            if self.verbose:
+                n_highlighted = len([row for _, row in display_df.iterrows() if str(row['id']) in training_ids])
+                print(f"   Highlighted {n_highlighted} training points")
+        
+        # Use percentile-based coloring or absolute confidence based on checkbox setting
+        if self.normalize_colors:
+            # Use percentile-based coloring (new default behavior)
+            if len(confidences) > 1:
+                # Calculate percentile ranks for each confidence value
+                # This maps each value to its percentile rank (0-1)
+                percentile_ranks = rankdata(confidences, method='average') / len(confidences)
+                
+                if self.verbose:
+                    conf_min, conf_max = np.min(confidences), np.max(confidences)
+                    p20 = np.percentile(confidences, 20)
+                    p50 = np.percentile(confidences, 50) 
+                    p80 = np.percentile(confidences, 80)
+                    print(f"   Original confidence range: [{conf_min:.3f}, {conf_max:.3f}]")
+                    print(f"   Confidence percentiles: 20th={p20:.3f}, 50th={p50:.3f}, 80th={p80:.3f}")
+                    print(f"   Using percentile-based coloring (upper 20% = darkest)")
+                
+                normalized_confidences = percentile_ranks
+            else:
+                # Single value case
+                normalized_confidences = np.full_like(confidences, 0.5)
+                if self.verbose:
+                    print(f"   Single confidence value: {confidences[0]:.3f}, using 0.5")
+        else:
+            # Use absolute confidence values (original behavior)
+            if len(confidences) > 1:
+                conf_min = np.min(confidences)
+                conf_max = np.max(confidences)
+                
+                if conf_max > conf_min:
+                    # Stretch to 0-1 range for consistent heatmap intensity
+                    normalized_confidences = (confidences - conf_min) / (conf_max - conf_min)
+                    if self.verbose:
+                        print(f"   Using absolute confidence, normalized from [{conf_min:.3f}, {conf_max:.3f}] to [0, 1]")
+                else:
+                    # All values are the same
+                    normalized_confidences = np.full_like(confidences, 0.5)
+                    if self.verbose:
+                        print(f"   All confidence values are {conf_min:.3f}, using 0.5")
+            else:
+                # Single value case
+                normalized_confidences = np.full_like(confidences, 0.5)
+                if self.verbose:
+                    print(f"   Single confidence value: {confidences[0]:.3f}, using 0.5")
+        
+        # Create location points for HeatmapLayer: [lat, lon, intensity]
+        heatmap_points = []
+        
+        for i, (_, row) in enumerate(display_df.iterrows()):
+            # Get lat/lon from geometry
+            if row['geometry'] is not None:
+                if hasattr(row['geometry'], 'coords'):
+                    # Point geometry
+                    lon, lat = row['geometry'].coords[0]
+                elif hasattr(row['geometry'], 'x'):
+                    # Point geometry (alternative access)
+                    lon, lat = row['geometry'].x, row['geometry'].y
+                else:
+                    continue
+                
+                # Use percentile rank as intensity
+                intensity = float(normalized_confidences[i])
+                
+                # Add point as [lat, lon, intensity]
+                heatmap_points.append([lat, lon, intensity])
+        
+        # Update heatmap layer
+        self.heatmap_layer.locations = heatmap_points
+        
+        if self.verbose:
+            final_min, final_max = (np.min(normalized_confidences), np.max(normalized_confidences))
+            mode = "percentile-based" if self.normalize_colors else "absolute confidence"
+            print(f"✅ Smooth heatmap updated with {len(heatmap_points)} points using {mode} coloring")
+            print(f"   Final intensity range: [{final_min:.3f}, {final_max:.3f}]")
+
     def close(self):
         """Clean up resources."""
         if hasattr(self, '_owns_connection') and self._owns_connection:
@@ -1468,3 +1903,47 @@ class GeoVibes:
                 self.duckdb_connection.close()
                 if self.verbose:
                     print("🔌 DuckDB connection closed.")
+
+    def _update_legend(self):
+        """Update legend dynamically based on current coloring mode."""
+        if self.normalize_colors:
+            heatmap_description = """<div style='margin-top: 3px;'><strong>Confidence Heatmap (Percentile-Based):</strong> 
+                    <span style='color: #0000ff; font-weight: bold;'>🔵 Bottom 20%</span> → 
+                    <span style='color: #00ffff; font-weight: bold;'>🔷 Lower-Middle</span> → 
+                    <span style='color: #ffff00; font-weight: bold;'>🟡 Upper-Middle</span> → 
+                    <span style='color: #ff0000; font-weight: bold;'>🔴 Top 20%</span>
+                    <br/><span style='font-size: 10px; color: #666;'>Colors based on percentile ranks, not absolute confidence</span>
+                </div>"""
+        else:
+            heatmap_description = """<div style='margin-top: 3px;'><strong>Confidence Heatmap (Absolute Values):</strong> 
+                    <span style='color: #0000ff; font-weight: bold;'>🔵 Low</span> → 
+                    <span style='color: #00ffff; font-weight: bold;'>🔷 Medium-Low</span> → 
+                    <span style='color: #ffff00; font-weight: bold;'>🟡 Medium-High</span> → 
+                    <span style='color: #ff0000; font-weight: bold;'>🔴 High</span>
+                    <br/><span style='font-size: 10px; color: #666;'>Colors based on actual confidence values, normalized to 0-1</span>
+                </div>"""
+        
+        if not hasattr(self, 'legend'):
+            self.legend = HTML()
+        
+        self.legend.value = f"""
+            <div style='background: white; padding: 5px; border-radius: 5px; opacity: 0.8; font-size: 12px;'>
+                <div><strong>Labels:</strong> 
+                    <span style='color: {UIConstants.POS_COLOR}; font-weight: bold;'>🔵 Positive</span> | 
+                    <span style='color: {UIConstants.NEG_COLOR}; font-weight: bold;'>🟠 Negative</span>
+                </div>
+                <div style='margin-top: 3px;'><strong>Search Results:</strong> 
+                    <span style='color: #00ff00; font-weight: bold;'>🟢 Most Similar</span> → 
+                    <span style='color: #ffff00; font-weight: bold;'>🟡 Medium</span> → 
+                    <span style='color: #ff4444; font-weight: bold;'>🔴 Least Similar</span>
+                </div>
+                {heatmap_description}
+            </div>
+        """
+
+    def _on_normalize_heatmap(self, change):
+        """Handle heatmap normalization toggle."""
+        self.normalize_colors = change['new']
+        self._update_legend()  # Update legend to reflect new mode
+        if self.show_heatmap and self.predictions_gdf is not None:
+            self._update_heatmap_layer()

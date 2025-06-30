@@ -419,7 +419,7 @@ EXAMPLE:
     )
     parser.add_argument("--input_file", type=str, required=True, help="Path to GeoParquet or GeoJSON file with MGRS tile geometries.")
     parser.add_argument("--roi_file", type=str, help="Path to a GeoJSON/GeoParquet file to filter MGRS tiles.")
-    parser.add_argument("--tilesize", type=int, default=25, help="Tile size in pixels.")
+    parser.add_argument("--tilesize", type=int, default=100, help="Tile size in pixels.")
     parser.add_argument("--overlap", type=int, default=0, help="Overlap in pixels.")
     parser.add_argument("--resolution", type=float, default=10.0, help="Resolution in meters per pixel.")
     parser.add_argument("--buffer_m", type=float, default=100.0, help="Buffer distance in meters for post-filtering chips against the ROI.")

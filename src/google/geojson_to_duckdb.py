@@ -265,6 +265,9 @@ def main():
     parser.add_argument("output_db_file", help="Path for the output DuckDB database file.")
     parser.add_argument("--mgrs_reference_file", default="/Users/christopherren/geovibes/geometries/mgrs_tiles.parquet", help="Path to the MGRS grid reference file.")
     parser.add_argument("--gcs_bucket", default="geovibes", help="GCS bucket to use for the embeddings.")
+    parser.add_argument("--tilesize", type=int, default=100, help="Tile size in pixels used in the embeddings data.")
+    parser.add_argument("--overlap", type=int, default=0, help="Overlap in pixels used in the embeddings data.")
+    parser.add_argument("--resolution", type=float, default=10.0, help="Resolution in meters per pixel used in the embeddings data.")
     parser.add_argument("--metric", default="cosine", choices=["cosine", "l2sq", "inner_product"], help="Distance metric for HNSW index.")
     parser.add_argument("--embedding_dim", type=int, default=64, help="Dimension of the embedding vectors.")
     parser.add_argument("--workers", type=int, default=-1, help="Number of parallel workers for processing files.")
@@ -285,6 +288,9 @@ def main():
 
         local_parquet_files = []
         tasks_to_process = []
+        
+        # Construct the tiling parameters string
+        tiling_params_str = f"{args.tilesize}_{args.overlap}_{int(args.resolution)}"
 
         logging.info("Checking for existing parquet files...")
         for mgrs_id, epsg_code in mgrs_epsg_map.items():
@@ -294,7 +300,7 @@ def main():
             if local_path.exists():
                 local_parquet_files.append(str(local_path))
             else:
-                gcs_path = f"gs://{args.gcs_bucket}/embeddings/google_satellite_v1/25_0_10/{mgrs_id}_2024.geojson"
+                gcs_path = f"gs://{args.gcs_bucket}/embeddings/google_satellite_v1/{tiling_params_str}/{mgrs_id}_2024.geojson"
                 tasks_to_process.append((gcs_path, epsg_code, args.output_dir))
         
         logging.info(f"Found {len(local_parquet_files)} existing parquet files.")
