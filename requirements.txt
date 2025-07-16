@@ -24,3 +24,7 @@ rasterio
 google-cloud-storage
 s3fs
 tenacity
+streamlit
+streamlit-folium
+folium
+protobuf==3.20.*

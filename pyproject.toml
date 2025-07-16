@@ -1,0 +1,28 @@
+[build-system]
+requires = ["setuptools>=61.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "geovibes"
+version = "0.1.0"
+description = "A geospatial similarity search tool with an interactive map interface."
+requires-python = ">=3.8"
+dependencies = [
+    "streamlit",
+    "folium",
+    "streamlit-folium",
+    "geopandas",
+    "duckdb",
+    "earthengine-api",
+    "pandas",
+    "numpy",
+    "matplotlib",
+    "protobuf==3.20.3",
+    "shapely",
+]
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[project.scripts]
+geovibes = "geovibes.runner:main" 
