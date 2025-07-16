@@ -65,7 +65,7 @@ def render_map(logic: GeoVibesLogic):
             pos_geojson,
             name="Positive Labels",
             marker=folium.CircleMarker(
-                radius=5, **LayerStyles.get_point_style(UIConstants.POS_COLOR)
+                **LayerStyles.get_point_style(UIConstants.POS_COLOR)
             ),
         ).add_to(m)
 
@@ -74,7 +74,7 @@ def render_map(logic: GeoVibesLogic):
             neg_geojson,
             name="Negative Labels",
             marker=folium.CircleMarker(
-                radius=5, **LayerStyles.get_point_style(UIConstants.NEG_COLOR)
+                **LayerStyles.get_point_style(UIConstants.NEG_COLOR)
             ),
         ).add_to(m)
 

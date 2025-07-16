@@ -402,7 +402,7 @@ class GeoVibesLogic:
             }
         )
 
-        return search_results_filtered
+        return self.detections_with_embeddings
 
     def find_nearest_point_id(self, lat: float, lon: float) -> Optional[str]:
         """Find the ID of the nearest point in the database to a given lat/lon."""
