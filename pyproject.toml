@@ -57,6 +57,8 @@ dependencies = [
     "pillow",
     "pre-commit",
     "pyarrow",
+    "pydantic",
+    "pydantic_settings",
     "pytest",
     "pytest-cov",
     "python-dotenv",

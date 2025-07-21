@@ -1,7 +1,6 @@
 """Interactive map interface for geospatial similarity search using satellite embeddings."""
 
 import json
-import os
 import warnings
 from datetime import datetime
 from typing import Dict, Optional
@@ -43,12 +42,12 @@ from .ee_tools import (
 from .ui_config import (
     UIConstants,
     BasemapConfig,
-    GeoVibesConfig,
     DatabaseConstants,
     LayerStyles,
 )
 from .ee_tools import initialize_ee_with_credentials
-from .utils import list_databases_in_directory, get_database_centroid
+from .utils import get_database_centroid
+from .models import Config
 
 warnings.simplefilter("ignore", category=FutureWarning)
 
@@ -66,56 +65,36 @@ class GeoVibes:
     """
 
     @classmethod
-    def from_config(cls, config_path, verbose=False, **kwargs):
-        """Create a GeoVibes instance from a configuration file (deprecated).
-
-        Args:
-            config_path: Path to JSON configuration file
-            verbose: If True, print detailed progress messages
-            **kwargs: Additional keyword arguments to override config values
-
-        Returns:
-            GeoVibes instance
-        """
-        if verbose:
-            print(
-                "⚠️  from_config() is deprecated. Use GeoVibes() with individual parameters instead."
-            )
-        return cls(config_path=config_path, verbose=verbose, **kwargs)
-
-    @classmethod
     def create(
         cls,
-        duckdb_path: Optional[str] = None,
-        duckdb_directory: Optional[str] = None,
-        boundary_path: Optional[str] = None,
-        start_date: str = "2024-01-01",
-        end_date: str = "2025-01-01",
+        config: Optional[Config] = None,
+        config_path: Optional[str] = None,
         gcp_project: Optional[str] = None,
         verbose: bool = False,
         **kwargs,
     ):
-        """Create a GeoVibes instance with explicit parameters.
+        """Create a GeoVibes instance with Config model.
 
         Args:
-            duckdb_path: Path to DuckDB database file
-            duckdb_directory: Directory containing multiple DuckDB database files
-            boundary_path: Path to boundary GeoJSON file
-            start_date: Start date in YYYY-MM-DD format for Earth Engine basemaps
-            end_date: End date in YYYY-MM-DD format for Earth Engine basemaps
-            gcp_project: Google Cloud Project ID for Earth Engine authentication
-            verbose: Enable detailed progress messages
+            config: Config instance with AOIs and options
+            config_path: Path to YAML config file to load
+            gcp_project: Google Cloud Project ID for Earth Engine authentication (overrides config)
+            verbose: Enable detailed progress messages (overrides config)
             **kwargs: Additional arguments
 
         Returns:
             GeoVibes instance
         """
+        if config is None and config_path is None:
+            raise ValueError("Either config or config_path must be provided")
+
+        if config is None:
+            from .models import load_config_from_yaml
+
+            config = load_config_from_yaml(config_path)
+
         return cls(
-            duckdb_path=duckdb_path,
-            duckdb_directory=duckdb_directory,
-            boundary_path=boundary_path,
-            start_date=start_date,
-            end_date=end_date,
+            config=config,
             gcp_project=gcp_project,
             verbose=verbose,
             **kwargs,
@@ -123,112 +102,76 @@ class GeoVibes:
 
     def __init__(
         self,
-        duckdb_path: Optional[str] = None,
-        duckdb_directory: Optional[str] = None,
-        boundary_path: Optional[str] = None,
-        start_date: Optional[str] = None,
-        end_date: Optional[str] = None,
+        config: Config,
         gcp_project: Optional[str] = None,
         duckdb_connection: Optional[duckdb.DuckDBPyConnection] = None,
-        config: Optional[Dict] = None,
-        config_path: Optional[str] = None,
         baselayer_url: Optional[str] = None,
         disable_ee: bool = False,
-        verbose: bool = False,
+        verbose: Optional[bool] = None,
         **kwargs,
     ) -> None:
-        """Initialize GeoVibes interface.
+        """Initialize GeoVibes interface with Config model.
 
         Args:
-            duckdb_path: Path to DuckDB database file.
-            duckdb_directory: Directory containing multiple DuckDB database files.
-            boundary_path: Path to boundary GeoJSON file.
-            start_date: Start date in YYYY-MM-DD format for Earth Engine basemaps.
-            end_date: End date in YYYY-MM-DD format for Earth Engine basemaps.
-            gcp_project: Google Cloud Project ID for Earth Engine authentication.
+            config: Config instance containing AOIs and options.
+            gcp_project: Google Cloud Project ID for Earth Engine authentication (overrides config).
             duckdb_connection: Existing DuckDB connection to reuse.
-            config: Configuration dictionary (deprecated, use individual parameters).
-            config_path: Path to JSON configuration file (deprecated, use individual parameters).
             baselayer_url: Custom basemap tile URL.
             disable_ee: Disable Earth Engine basemaps.
-            verbose: Enable detailed progress messages.
+            verbose: Enable detailed progress messages (overrides config).
             **kwargs: Additional arguments for backwards compatibility.
 
         Raises:
-            ValueError: If no database is available given the provided parameters.
-            FileNotFoundError: If no .db files are found in the provided directory.
+            ValueError: If no AOIs are provided in config.
             RuntimeError: If there is an error connecting to the database.
         """
-        self.verbose = verbose
+        self.config = config
+
+        # Use verbose from parameter or config
+        self.verbose = verbose if verbose is not None else config.options.verbose
+
         if self.verbose:
             print("Initializing GeoVibes...")
 
-        # Handle backwards compatibility with config files
-        if config_path is not None:
-            if self.verbose:
-                print(
-                    "⚠️  config_path is deprecated. Use individual parameters instead."
-                )
-            self.config = GeoVibesConfig.from_file(config_path)
-            self.config.validate()
-        elif config is not None:
-            if self.verbose:
-                print(
-                    "⚠️  config dict is deprecated. Use individual parameters instead."
-                )
-            self.config = GeoVibesConfig.from_dict(config)
-            self.config.validate()
-        else:
-            # Only validate if we have the minimum required parameters
-            if (
-                duckdb_path is None
-                and duckdb_directory is None
-                and duckdb_connection is None
-            ):
-                raise ValueError(
-                    "Either duckdb_path, duckdb_directory, or duckdb_connection must be provided"
-                )
+        # Validate config
+        if not config.aois:
+            raise ValueError("At least one AOI must be provided in config")
 
-            # Use individual parameters to create config
-            self.config = GeoVibesConfig(
-                duckdb_path=duckdb_path,
-                duckdb_directory=duckdb_directory,
-                boundary_path=boundary_path,
-                start_date=start_date or "2024-01-01",
-                end_date=end_date or "2025-01-01",
-                gcp_project=gcp_project,
-            )
-
-            self.config.validate()
+        # Use gcp_project parameter or extract from environment/config
+        self.gcp_project = gcp_project
 
         self.ee_available = not disable_ee and initialize_ee_with_credentials(
-            self.config.gcp_project
+            self.gcp_project
         )
 
-        # Initialize database list if directory is provided
-        self.available_databases = []
-        self.current_database_path = None
-        if self.config.duckdb_directory:
-            self.available_databases = list_databases_in_directory(
-                self.config.duckdb_directory, verbose=self.verbose
-            )
-            if self.available_databases:
-                self.current_database_path = self.available_databases[0]
-                if self.verbose:
-                    print(
-                        f"📁 Found {len(self.available_databases)} databases in directory"
-                    )
-            else:
-                raise FileNotFoundError("⚠️  No .db files found in directory")
-        elif self.config.duckdb_path:
-            self.current_database_path = self.config.duckdb_path
+        # Initialize AOI state
+        self.current_aoi = config.aois[0]  # Start with first AOI
+        self.available_databases = list(
+            self.current_aoi.dbs.items()
+        )  # List of (name, path) tuples
+        self.current_database_name = (
+            list(self.current_aoi.dbs.keys())[0] if self.current_aoi.dbs else None
+        )
+        self.current_database_path = (
+            list(self.current_aoi.dbs.values())[0] if self.current_aoi.dbs else None
+        )
+
+        if self.verbose:
+            print(f"📍 Starting with AOI: {self.current_aoi.name}")
+            if self.current_database_name:
+                print(f"💾 Starting with database: {self.current_database_name}")
 
         if baselayer_url is None:
-            baselayer_url = BasemapConfig.BASEMAP_TILES["MAPTILER"]
+            # Use AOI-specific basemap if available, otherwise default
+            if self.current_aoi.basemap_tile_server_url:
+                baselayer_url = self.current_aoi.basemap_tile_server_url
+            else:
+                baselayer_url = BasemapConfig.BASEMAP_TILES["MAPTILER"]
 
+        # Set up database connection
         if duckdb_connection is None:
             if self.current_database_path is None:
-                raise ValueError("No database available given the provided parameters")
+                raise ValueError("No database available for the current AOI")
 
             # Show connection status for GCS paths
             if DatabaseConstants.is_gcs_path(self.current_database_path):
@@ -271,6 +214,7 @@ class GeoVibes:
         else:
             self.duckdb_connection = duckdb_connection
             self._owns_connection = False
+
         self.current_basemap = "MAPTILER"
         self.basemap_layer = ipyl.TileLayer(
             url=baselayer_url,
@@ -278,11 +222,13 @@ class GeoVibes:
             name="basemap",
             attribution=BasemapConfig.MAPTILER_ATTRIBUTION,
         )
+
+        # Set up Earth Engine boundary for current AOI
         if self.ee_available:
             try:
                 self.ee_boundary = ee.Geometry(
                     shapely.geometry.mapping(
-                        gpd.read_file(self.config.boundary_path).union_all()
+                        gpd.read_file(self.current_aoi.boundary).union_all()
                     )
                 )
             except Exception as e:
@@ -425,23 +371,25 @@ class GeoVibes:
                 if self.verbose:
                     print("🛰️ Setting up Earth Engine basemaps (S2 RGB, NDVI, NDWI)...")
 
+                # Use dates from config.options
+                start_date = self.config.options.ee_basemap_start_date.strftime(
+                    "%Y-%m-%d"
+                )
+                end_date = self.config.options.ee_basemap_end_date.strftime("%Y-%m-%d")
+
                 s2_rgb_median = get_s2_rgb_median(
-                    self.ee_boundary, self.config.start_date, self.config.end_date
+                    self.ee_boundary, start_date, end_date
                 )
                 s2_rgb_url = get_ee_image_url(
                     s2_rgb_median, BasemapConfig.S2_RGB_VIS_PARAMS
                 )
                 self.basemap_tiles["S2_RGB"] = s2_rgb_url
 
-                ndvi_median = get_s2_ndvi_median(
-                    self.ee_boundary, self.config.start_date, self.config.end_date
-                )
+                ndvi_median = get_s2_ndvi_median(self.ee_boundary, start_date, end_date)
                 ndvi_url = get_ee_image_url(ndvi_median, BasemapConfig.NDVI_VIS_PARAMS)
                 self.basemap_tiles["NDVI"] = ndvi_url
 
-                ndwi_median = get_s2_ndwi_median(
-                    self.ee_boundary, self.config.start_date, self.config.end_date
-                )
+                ndwi_median = get_s2_ndwi_median(self.ee_boundary, start_date, end_date)
                 ndwi_url = get_ee_image_url(ndwi_median, BasemapConfig.NDWI_VIS_PARAMS)
                 self.basemap_tiles["NDWI"] = ndwi_url
 
@@ -497,6 +445,38 @@ class GeoVibes:
             [self.search_btn, self.neighbors_slider, self.reset_btn],
             layout=Layout(padding="5px", margin="0 0 10px 0"),
         )
+
+        # --- AOI Selection section ---
+        self.aoi_dropdown = None
+        aoi_section_widgets = []
+        if len(self.config.aois) > 1:
+            # Create dropdown with AOI names
+            aoi_options = [(aoi.name, aoi) for aoi in self.config.aois]
+            self.aoi_dropdown = Dropdown(
+                options=aoi_options,
+                value=self.current_aoi,
+                description="",
+                layout=Layout(width="100%"),
+            )
+            aoi_section_widgets.append(Label("Select AOI:"))
+            aoi_section_widgets.append(self.aoi_dropdown)
+
+        # --- Database Selection section ---
+        self.database_dropdown = None
+        database_section_widgets = []
+        if self.current_aoi.dbs:
+            # Create dropdown with database names for current AOI
+            database_options = [
+                (name, path) for name, path in self.current_aoi.dbs.items()
+            ]
+            self.database_dropdown = Dropdown(
+                options=database_options,
+                value=self.current_database_path,
+                description="",
+                layout=Layout(width="100%"),
+            )
+            database_section_widgets.append(Label("Select Database:"))
+            database_section_widgets.append(self.database_dropdown)
 
         # --- Labeling section ---
         self.label_toggle = ToggleButtons(
@@ -556,23 +536,6 @@ class GeoVibes:
             layout=Layout(width="100%", display="none"),  # Initially hidden
         )
 
-        # --- Database Selection section ---
-        self.database_dropdown = None
-        database_section_widgets = []
-        if self.available_databases:
-            # Create dropdown with database names (showing just filenames for clarity)
-            database_options = [
-                (os.path.basename(db), db) for db in self.available_databases
-            ]
-            self.database_dropdown = Dropdown(
-                options=database_options,
-                value=self.current_database_path,
-                description="",
-                layout=Layout(width="100%"),
-            )
-            database_section_widgets.append(Label("Select Database:"))
-            database_section_widgets.append(self.database_dropdown)
-
         # --- Add Vector Layer section ---
         self.add_vector_btn = Button(
             description="📄 Add Vector Layer",
@@ -590,39 +553,52 @@ class GeoVibes:
             description="🌍 Google Maps ↗", layout=Layout(width="100%"), button_style=""
         )
 
-        # Build accordion - conditionally include database section
-        accordion_children = [
-            VBox(
-                [
-                    Label("Label Type:"),
-                    self.label_toggle,
-                    Label("Selection Mode:", layout=Layout(margin="10px 0 0 0")),
-                    self.selection_mode,
-                ],
-                layout=Layout(padding="5px"),
-            ),
-            VBox(basemap_section_widgets, layout=Layout(padding="5px")),
-            VBox(
-                [
-                    self.save_btn,
-                    self.load_btn,
-                    self.file_upload,
-                    self.add_vector_btn,
-                    self.vector_file_upload,
-                    self.google_maps_btn,
-                ],
-                layout=Layout(padding="5px"),
-            ),
-        ]
+        # Build accordion - conditionally include AOI and database sections
+        accordion_children = []
+        accordion_titles = []
 
-        accordion_titles = ["Label Mode", "Basemaps", "Export & Tools"]
-
-        # Add database section if available
-        if database_section_widgets:
-            accordion_children.insert(
-                0, VBox(database_section_widgets, layout=Layout(padding="5px"))
+        # Add AOI section if multiple AOIs available
+        if aoi_section_widgets:
+            accordion_children.append(
+                VBox(aoi_section_widgets, layout=Layout(padding="5px"))
             )
-            accordion_titles.insert(0, "Database")
+            accordion_titles.append("Area of Interest")
+
+        # Add database section if databases available
+        if database_section_widgets:
+            accordion_children.append(
+                VBox(database_section_widgets, layout=Layout(padding="5px"))
+            )
+            accordion_titles.append("Database")
+
+        # Add other sections
+        accordion_children.extend(
+            [
+                VBox(
+                    [
+                        Label("Label Type:"),
+                        self.label_toggle,
+                        Label("Selection Mode:", layout=Layout(margin="10px 0 0 0")),
+                        self.selection_mode,
+                    ],
+                    layout=Layout(padding="5px"),
+                ),
+                VBox(basemap_section_widgets, layout=Layout(padding="5px")),
+                VBox(
+                    [
+                        self.save_btn,
+                        self.load_btn,
+                        self.file_upload,
+                        self.add_vector_btn,
+                        self.vector_file_upload,
+                        self.google_maps_btn,
+                    ],
+                    layout=Layout(padding="5px"),
+                ),
+            ]
+        )
+
+        accordion_titles.extend(["Label Mode", "Basemaps", "Export & Tools"])
 
         accordion = Accordion(children=accordion_children)
 
@@ -631,7 +607,8 @@ class GeoVibes:
             accordion.set_title(i, title)
 
         # Open label mode by default
-        accordion.selected_index = 0
+        label_model_index = accordion_titles.index("Label Mode")
+        accordion.selected_index = label_model_index
 
         # Add collapse/expand functionality
         self.panel_collapsed = False
@@ -678,6 +655,8 @@ class GeoVibes:
             "vector_file_upload": self.vector_file_upload,
             "google_maps_btn": self.google_maps_btn,
             "collapse_btn": self.collapse_btn,
+            "aoi_dropdown": self.aoi_dropdown,
+            "database_dropdown": self.database_dropdown,
         }
 
         return panel_content, ui_widgets
@@ -997,6 +976,10 @@ class GeoVibes:
         # Basemap buttons
         for basemap_name, btn in self.basemap_buttons.items():
             btn.on_click(lambda b, name=basemap_name: self._on_basemap_select(name))
+
+        # AOI dropdown
+        if self.aoi_dropdown:
+            self.aoi_dropdown.observe(self._on_aoi_change, names=["value"])
 
         # Database dropdown
         if self.database_dropdown:
@@ -2158,62 +2141,20 @@ class GeoVibes:
             else:
                 btn.button_style = ""  # Default style
 
-    def _construct_boundary_path(self, database_path: str) -> str:
-        """Construct boundary path from database path.
-
-        Args:
-            database_path: Path to database (e.g., gs://geovibes/databases/google/bali.db)
-
-        Returns:
-            Constructed boundary path (e.g., gs://geovibes/geometries/bali.geojson)
-        """
-        import os
-
-        # Extract the database name without extension
-        db_filename = os.path.basename(
-            database_path
-        )  # e.g., "bali.db" or "bali_google.db"
-        db_name_with_ext = os.path.splitext(db_filename)[
-            0
-        ]  # e.g., "bali" or "bali_google"
-
-        # For boundary files, we want just the region name (first part before underscore if any)
-        # e.g., "bali_google" -> "bali", "java_google" -> "java"
-        if "_" in db_name_with_ext:
-            db_name = db_name_with_ext.split("_")[0]
-        else:
-            db_name = db_name_with_ext
-
-        # Replace the databases part with geometries
-        if database_path.startswith("gs://"):
-            # Handle GCS paths
-            parts = database_path.split("/")
-            # Find the bucket and construct new path
-            bucket = parts[2]  # e.g., "geovibes"
-            boundary_path = f"gs://{bucket}/geometries/{db_name}.geojson"
-        else:
-            # Handle local paths
-            db_dir = os.path.dirname(database_path)
-            # Go up one level and enter geometries folder
-            parent_dir = os.path.dirname(db_dir)
-            boundary_path = os.path.join(parent_dir, "geometries", f"{db_name}.geojson")
-
-        return boundary_path
-
     def _update_ee_boundary(self):
-        """Update Earth Engine boundary based on current effective boundary path."""
+        """Update Earth Engine boundary based on current AOI boundary."""
         if not self.ee_available:
             return
 
-        if self.effective_boundary_path:
+        if self.current_aoi.boundary:
             try:
-                boundary_gdf = gpd.read_file(self.effective_boundary_path)
+                boundary_gdf = gpd.read_file(self.current_aoi.boundary)
                 self.ee_boundary = ee.Geometry(
                     shapely.geometry.mapping(boundary_gdf.union_all())
                 )
                 if self.verbose:
                     print(
-                        f"🛰️ Updated Earth Engine boundary from: {self.effective_boundary_path}"
+                        f"🛰️ Updated Earth Engine boundary from: {self.current_aoi.boundary}"
                     )
             except Exception as e:
                 if self.verbose:
@@ -2233,14 +2174,14 @@ class GeoVibes:
         for layer in layers_to_remove:
             self.map.remove_layer(layer)
 
-        # Add new boundary layer if we have an effective boundary path
-        if hasattr(self, "effective_boundary_path") and self.effective_boundary_path:
+        # Add new boundary layer if we have a boundary in current AOI
+        if self.current_aoi.boundary:
             try:
                 if self.verbose:
-                    print(f"🗺️  Loading boundary layer: {self.effective_boundary_path}")
+                    print(f"🗺️  Loading boundary layer: {self.current_aoi.boundary}")
 
                 # Use geopandas to read the file (handles both local and GCS paths)
-                boundary_gdf = gpd.read_file(self.effective_boundary_path)
+                boundary_gdf = gpd.read_file(self.current_aoi.boundary)
 
                 # Convert to GeoJSON format for ipyleaflet
                 boundary_geojson = boundary_gdf.to_json()
@@ -2263,11 +2204,8 @@ class GeoVibes:
         Returns:
             Tuple of (center_y, center_x) coordinates
         """
-        # Determine boundary path
-        boundary_path = self.config.boundary_path
-        if not boundary_path and self.current_database_path:
-            # Auto-construct boundary path from database path
-            boundary_path = self._construct_boundary_path(self.current_database_path)
+        # Use boundary from current AOI
+        boundary_path = self.current_aoi.boundary
 
         if boundary_path:
             try:
@@ -2291,10 +2229,23 @@ class GeoVibes:
         else:
             self.effective_boundary_path = None
 
-        # Use database centroid for centering
-        center_y, center_x = get_database_centroid(
-            self.duckdb_connection, verbose=self.verbose
-        )
+        # Use database centroid for centering if boundary failed or not available
+        if (
+            self.current_database_path
+            and hasattr(self, "duckdb_connection")
+            and self.duckdb_connection
+        ):
+            center_y, center_x = get_database_centroid(
+                self.duckdb_connection, verbose=self.verbose
+            )
+        else:
+            # Fallback to a default center if no database connection
+            center_y, center_x = 0.0, 0.0
+            if self.verbose:
+                print(
+                    "⚠️  No database connection available, using default center (0, 0)"
+                )
+
         return center_y, center_x
 
     def _warm_up_gcs_database(self):
@@ -2336,14 +2287,21 @@ class GeoVibes:
                 print(f"⚠️  Database warm-up failed: {str(e)}")
 
     def _on_database_change(self, change):
-        """Handle database selection change."""
+        """Handle database selection change within current AOI."""
         new_database_path = change["new"]
 
         if new_database_path == self.current_database_path:
             return  # No change
 
+        # Find the database name from the current AOI
+        new_database_name = None
+        for name, path in self.current_aoi.dbs.items():
+            if path == new_database_path:
+                new_database_name = name
+                break
+
         if self.verbose:
-            print(f"🔄 Switching to database: {os.path.basename(new_database_path)}")
+            print(f"🔄 Switching to database: {new_database_name or 'Unknown'}")
 
         # Show loading message immediately
         self._show_operation_status(
@@ -2351,27 +2309,10 @@ class GeoVibes:
         )
 
         try:
-            # Step 1: Quick UI updates - pan map and switch boundary first
+            # Update database references
             old_database_path = self.current_database_path
             self.current_database_path = new_database_path
-
-            # Update boundary path and recenter map immediately (fast operation)
-            lat, lon = (
-                self._setup_boundary_and_center()
-            )  # Returns (lat, lon) - center_y, center_x
-            self.map.center = (lat, lon)  # ipyleaflet expects (lat, lon)
-
-            if self.verbose:
-                print(f"📍 Map recentered to: {lat:.4f}, {lon:.4f}")
-
-            # Update Earth Engine boundary (also relatively fast)
-            self._update_ee_boundary()
-
-            # Update boundary layer on map
-            self._update_boundary_layer()
-
-            # Step 2: Heavy database operations in background
-            self._show_operation_status("🔄 Connecting to new database...")
+            self.current_database_name = new_database_name
 
             # Close current connection if we own it
             if hasattr(self, "_owns_connection") and self._owns_connection:
@@ -2392,12 +2333,11 @@ class GeoVibes:
                 self.duckdb_connection.execute(query)
 
             # Setup extensions
-            if new_database_path:
-                extension_queries = DatabaseConstants.get_extension_setup_queries(
-                    new_database_path
-                )
-                for query in extension_queries:
-                    self.duckdb_connection.execute(query)
+            extension_queries = DatabaseConstants.get_extension_setup_queries(
+                new_database_path
+            )
+            for query in extension_queries:
+                self.duckdb_connection.execute(query)
 
             # Detect embedding dimension
             self._show_operation_status("🔄 Analyzing database structure...")
@@ -2419,12 +2359,10 @@ class GeoVibes:
 
             # Success!
             self._show_operation_status(
-                f"✅ Successfully loaded: {os.path.basename(new_database_path)}"
+                f"✅ Successfully loaded: {new_database_name or 'database'}"
             )
             if self.verbose:
-                print(
-                    f"✅ Successfully switched to database: {os.path.basename(new_database_path)}"
-                )
+                print(f"✅ Successfully switched to database: {new_database_name}")
 
         except Exception as e:
             if self.verbose:
@@ -2436,13 +2374,6 @@ class GeoVibes:
                 self.database_dropdown.value = old_database_path
 
             self._show_operation_status(f"❌ Failed to load database: {str(e)}")
-
-            # Try to restore previous map position
-            try:
-                lat, lon = self._setup_boundary_and_center()
-                self.map.center = (lat, lon)
-            except:
-                pass  # If this fails too, just leave the map where it is
 
     def _reset_all_state(self):
         """Reset all application state for database switching."""
@@ -2481,3 +2412,135 @@ class GeoVibes:
                 self.duckdb_connection.close()
                 if self.verbose:
                     print("🔌 DuckDB connection closed.")
+
+    def _on_aoi_change(self, change):
+        """Handle AOI selection change."""
+        new_aoi = change["new"]
+
+        if new_aoi == self.current_aoi:
+            return  # No change
+
+        if self.verbose:
+            print(f"🔄 Switching to AOI: {new_aoi.name}")
+
+        # Show loading message immediately
+        self._show_operation_status(
+            "🔄 Loading AOI (this can take a couple of seconds)..."
+        )
+
+        try:
+            # Step 1: Quick UI updates - update AOI and boundary first
+            old_aoi = self.current_aoi
+            self.current_aoi = new_aoi
+
+            # Update available databases for the new AOI
+            self.available_databases = list(self.current_aoi.dbs.items())
+
+            # Set the first database as current if available
+            if self.current_aoi.dbs:
+                self.current_database_name = list(self.current_aoi.dbs.keys())[0]
+                self.current_database_path = list(self.current_aoi.dbs.values())[0]
+            else:
+                self.current_database_name = None
+                self.current_database_path = None
+
+            # Update database dropdown options
+            if self.database_dropdown:
+                if self.current_aoi.dbs:
+                    database_options = [
+                        (name, path) for name, path in self.current_aoi.dbs.items()
+                    ]
+                    self.database_dropdown.options = database_options
+                    self.database_dropdown.value = self.current_database_path
+                else:
+                    self.database_dropdown.options = []
+
+            # Update boundary path and recenter map
+            lat, lon = self._setup_boundary_and_center()
+            self.map.center = (lat, lon)
+
+            if self.verbose:
+                print(f"📍 Map recentered to: {lat:.4f}, {lon:.4f}")
+
+            # Update Earth Engine boundary
+            self._update_ee_boundary()
+
+            # Update boundary layer on map
+            self._update_boundary_layer()
+
+            # Step 2: Heavy database operations if we have a database
+            if self.current_database_path:
+                self._show_operation_status("🔄 Connecting to new database...")
+
+                # Close current connection if we own it
+                if hasattr(self, "_owns_connection") and self._owns_connection:
+                    if hasattr(self, "duckdb_connection") and self.duckdb_connection:
+                        self.duckdb_connection.close()
+
+                # Reset all application state
+                self._reset_all_state()
+
+                # Establish new connection
+                self.duckdb_connection = DatabaseConstants.setup_duckdb_connection(
+                    self.current_database_path, read_only=True
+                )
+                self._owns_connection = True
+
+                # Configure memory limits
+                for query in DatabaseConstants.get_memory_setup_queries():
+                    self.duckdb_connection.execute(query)
+
+                # Setup extensions
+                extension_queries = DatabaseConstants.get_extension_setup_queries(
+                    self.current_database_path
+                )
+                for query in extension_queries:
+                    self.duckdb_connection.execute(query)
+
+                # Detect embedding dimension
+                self._show_operation_status("🔄 Analyzing database structure...")
+                try:
+                    self.embedding_dim = DatabaseConstants.detect_embedding_dimension(
+                        self.duckdb_connection
+                    )
+                    if self.verbose:
+                        print(f"🔍 Detected embedding dimension: {self.embedding_dim}")
+                except ValueError as e:
+                    if self.verbose:
+                        print(f"⚠️ Could not detect embedding dimension: {e}")
+                    self.embedding_dim = 384
+
+                # Warm up GCS database if needed
+                if DatabaseConstants.is_gcs_path(self.current_database_path):
+                    self._show_operation_status("🔄 Optimizing database connection...")
+                    self._warm_up_gcs_database()
+
+            # Update Earth Engine basemaps for new AOI
+            if self.ee_available and self.ee_boundary is not None:
+                self._show_operation_status("🔄 Updating Earth Engine basemaps...")
+                self._setup_ee_basemaps()
+
+            # Success!
+            self._show_operation_status(f"✅ Successfully loaded AOI: {new_aoi.name}")
+            if self.verbose:
+                print(f"✅ Successfully switched to AOI: {new_aoi.name}")
+                if self.current_database_name:
+                    print(f"✅ Using database: {self.current_database_name}")
+
+        except Exception as e:
+            if self.verbose:
+                print(f"❌ Failed to switch AOI: {str(e)}")
+
+            # Revert to previous AOI
+            self.current_aoi = old_aoi
+            if self.aoi_dropdown:
+                self.aoi_dropdown.value = old_aoi
+
+            self._show_operation_status(f"❌ Failed to load AOI: {str(e)}")
+
+            # Try to restore previous map position
+            try:
+                lat, lon = self._setup_boundary_and_center()
+                self.map.center = (lat, lon)
+            except:
+                pass  # If this fails too, just leave the map where it is

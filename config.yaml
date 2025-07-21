@@ -1,16 +1,11 @@
-# GeoVibes Configuration File
-# This file contains the configuration for running GeoVibes as a web application
+embeddings:
+    - name: "alabama"
+      boundary: /Users/noah/Dev/geovibes/geometries/alabama.geojson
+      dbs:
+          alabama_google: /Users/noah/Dev/geovibes/local_databases/alabama_google.db
 
-# Database configuration - specify either duckdb_path OR duckdb_directory
-duckdb_directory: /Users/noah/Dev/geovibes/local_databases
-# duckdb_path: ./local_databases/alabama_google.db
-
-# Geographic boundary file
-boundary_path: /Users/noah/Dev/geovibes/geometries/alabama.geojson
-
-# Date range for Earth Engine basemaps (YYYY-MM-DD format)
-start_date: "2024-01-01"
-end_date: "2025-01-01"
-# Google Cloud Project for Earth Engine authentication (optional)
-# Uncomment and set your project ID if you want NDVI/NDWI basemaps
-# gcp_project: "your-gcp-project-id"
+options:
+    ee_basemap_start_date: "2024-01-01"
+    ee_basemap_end_date: "2025-01-01"
+    verbose: true
+    local_download_path: /Users/noah/Dev/geovibes/local_downloads

@@ -96,6 +96,9 @@ Create a `.env` file in the repository root for sensitive configuration:
 # Required for MapTiler satellite basemaps
 MAPTILER_API_KEY=your_maptiler_api_key_here
 
+# Optional: Google Cloud Platform project ID (for Earth Engine basemaps)
+GCS_PROJECT=your_gcs_project_here
+
 # Optional: For Google Cloud Storage database access
 GCS_ACCESS_KEY_ID=your_access_key_here
 GCS_SECRET_ACCESS_KEY=your_secret_key_here

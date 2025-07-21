@@ -7,7 +7,6 @@ that can be accessed via a web browser instead of Jupyter notebook.
 
 Usage:
     python run.py --config config.yaml
-    python run.py --duckdb-directory ./local_databases --boundary geometries/alabama.geojson
     python run.py --help
 
 The script will start a web server and open the GeoVibes interface in your default browser.
@@ -17,8 +16,6 @@ import argparse
 import os
 import sys
 import webbrowser
-from pathlib import Path
-import yaml
 import tempfile
 import atexit
 import subprocess
@@ -35,55 +32,20 @@ Examples:
   # Use YAML config file
   python run.py --config config.yaml
   
-  # Use individual parameters
-  python run.py --duckdb-directory ./local_databases --boundary geometries/alabama.geojson
+  # Use YAML config file with verbose output
+  python run.py --config config.yaml --verbose
   
-  # Override config with individual parameters
-  python run.py --config config.yaml --verbose --start-date 2024-06-01
+  # Specify custom port
+  python run.py --config config.yaml --port 8888
         """,
     )
 
-    # Configuration file options
+    # Configuration file (required)
     parser.add_argument(
-        "--config", type=str, help="Path to configuration file (YAML or JSON format)"
-    )
-
-    # Database options
-    parser.add_argument("--duckdb-path", type=str, help="Path to DuckDB database file")
-    parser.add_argument(
-        "--duckdb-directory",
+        "--config",
         type=str,
-        help="Directory containing DuckDB database files",
-    )
-
-    # Geographic options
-    parser.add_argument(
-        "--boundary",
-        "--boundary-path",
-        dest="boundary_path",
-        type=str,
-        help="Path to boundary GeoJSON file",
-    )
-
-    # Date options
-    parser.add_argument(
-        "--start-date",
-        type=str,
-        default="2024-01-01",
-        help="Start date for Earth Engine basemaps (YYYY-MM-DD format, default: 2024-01-01)",
-    )
-    parser.add_argument(
-        "--end-date",
-        type=str,
-        default="2025-01-01",
-        help="End date for Earth Engine basemaps (YYYY-MM-DD format, default: 2025-01-01)",
-    )
-
-    # Google Cloud options
-    parser.add_argument(
-        "--gcp-project",
-        type=str,
-        help="Google Cloud Project ID for Earth Engine authentication",
+        required=True,
+        help="Path to configuration file (YAML format) - REQUIRED",
     )
 
     # Web server options
@@ -102,53 +64,22 @@ Examples:
     parser.add_argument(
         "--no-browser", action="store_true", help="Do not automatically open browser"
     )
-
-    # Other options
-    parser.add_argument(
-        "--verbose", "-v", action="store_true", help="Enable verbose output"
-    )
+    parser.add_argument("--verbose", action="store_true", help="Enable verbose output")
 
     return parser.parse_args()
 
 
-def load_config_file(config_path):
-    """Load configuration from YAML file."""
-    config_path = Path(config_path)
+def create_notebook_content(config_path):
+    """Create a temporary notebook that initializes GeoVibes with the given config path."""
 
-    if not config_path.exists():
-        raise FileNotFoundError(f"Configuration file not found: {config_path}")
+    # Build the initialization code - just a single cell calling GeoVibes.create
+    init_code = [
+        "# Auto-generated GeoVibes initialization",
+        "from geovibes.ui import GeoVibes",
+        "",
+        f"vibes = GeoVibes.create(config_path=r'{config_path}')",
+    ]
 
-    with open(config_path, "r") as f:
-        if config_path.suffix.lower() in [".yaml", ".yml"]:
-            return yaml.safe_load(f)
-        else:
-            raise ValueError(f"Unsupported file type: {config_path.suffix}")
-
-
-def merge_config(file_config, args):
-    """Merge file configuration with command line arguments."""
-    # Start with file config
-    config = file_config.copy() if file_config else {}
-
-    # Override with command line arguments (only if they were explicitly provided)
-    arg_mappings = {
-        "duckdb_path": args.duckdb_path,
-        "duckdb_directory": args.duckdb_directory,
-        "boundary_path": args.boundary_path,
-        "start_date": args.start_date,
-        "end_date": args.end_date,
-        "gcp_project": args.gcp_project,
-    }
-
-    for key, value in arg_mappings.items():
-        if value is not None:
-            config[key] = value
-
-    return config
-
-
-def create_notebook_content(config, verbose=False):
-    """Create a temporary notebook that initializes GeoVibes with the given config."""
     notebook_content = {
         "cells": [
             {
@@ -156,30 +87,7 @@ def create_notebook_content(config, verbose=False):
                 "execution_count": None,
                 "metadata": {},
                 "outputs": [],
-                "source": [
-                    "# Auto-generated GeoVibes initialization\n",
-                    "import sys\n",
-                    "import os\n",
-                    "\n",
-                    "# Add src directory to path\n",
-                    "sys.path.insert(0, os.path.join(os.getcwd(), 'src'))\n",
-                    "\n",
-                    "from geovibes.ui import GeoVibes\n",
-                    "\n",
-                    "# Initialize GeoVibes with configuration\n",
-                    f"config = {repr(config)}\n",
-                    f"verbose = {verbose}\n",
-                    "\n",
-                    "vibes = GeoVibes(\n",
-                    "    duckdb_path=config.get('duckdb_path'),\n",
-                    "    duckdb_directory=config.get('duckdb_directory'),\n",
-                    "    boundary_path=config.get('boundary_path'),\n",
-                    "    start_date=config.get('start_date', '2024-01-01'),\n",
-                    "    end_date=config.get('end_date', '2025-01-01'),\n",
-                    "    gcp_project=config.get('gcp_project'),\n",
-                    "    verbose=verbose\n",
-                    ")",
-                ],
+                "source": init_code,
             },
         ],
         "metadata": {
@@ -205,11 +113,11 @@ def create_notebook_content(config, verbose=False):
     return notebook_content
 
 
-def run_with_voila(config, args):
+def run_with_voila(config_path, args):
     """Run the application using Voila."""
 
     # Create temporary notebook
-    notebook_content = create_notebook_content(config, args.verbose)
+    notebook_content = create_notebook_content(config_path)
 
     # Create temporary file
     temp_dir = tempfile.mkdtemp()
@@ -230,7 +138,7 @@ def run_with_voila(config, args):
         json.dump(notebook_content, f, indent=2)
 
     print(f"🚀 Starting GeoVibes web application on http://{args.host}:{args.port}")
-    print(f"📊 Configuration: {config}")
+    print(f"📊 Config: {config_path}")
 
     if not args.no_browser:
         # Give the server a moment to start before opening browser
@@ -259,13 +167,11 @@ def run_with_voila(config, args):
     ]
 
     # Run Voila as subprocess with error suppression
-    with open(os.devnull, "w") as devnull:
-        # Redirect stderr to capture and filter errors
-        process = subprocess.Popen(
-            voila_cmd,
-            stderr=subprocess.PIPE if not args.verbose else None,
-            universal_newlines=True,
-        )
+    process = subprocess.Popen(
+        voila_cmd,
+        stderr=subprocess.PIPE if not args.verbose else None,
+        universal_newlines=True,
+    )
 
     try:
         process.wait()
@@ -283,31 +189,15 @@ def main():
     """Main entry point for the GeoVibes web application."""
     args = parse_arguments()
 
-    # Load configuration
-    file_config = {}
-    if args.config:
-        try:
-            file_config = load_config_file(args.config)
-            if args.verbose:
-                print(f"✅ Loaded configuration from: {args.config}")
-        except Exception as e:
-            print(f"❌ Error loading config file: {e}")
-            sys.exit(1)
-
-    # Merge file config with command line arguments
-    config = merge_config(file_config, args)
-
-    # Validate configuration
-    if not config.get("duckdb_path") and not config.get("duckdb_directory"):
-        print("❌ Error: Either --duckdb-path or --duckdb-directory must be provided")
+    # Validate that config file exists
+    if not os.path.exists(args.config):
+        print(f"❌ Error: Config file not found: {args.config}")
         sys.exit(1)
 
     if args.verbose:
-        print("🔧 Final configuration:")
-        for key, value in config.items():
-            print(f"   {key}: {value}")
+        print(f"✅ Using configuration file: {args.config}")
 
-    run_with_voila(config, args)
+    run_with_voila(args.config, args)
 
 
 if __name__ == "__main__":
