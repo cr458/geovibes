@@ -142,7 +142,12 @@ def ingest_parquet_to_duckdb(parquet_files: list[str], db_path: str, embedding_d
             # The geometry column from GeoParquet is already understood by DuckDB's spatial extension.
             # No explicit cast is needed if the target column is type GEOMETRY.
             if has_geometry:
-                select_clause += ", geometry"
+                select_clause += """,
+                    CASE
+                        WHEN ST_GeometryType(geometry) = 'POINT' THEN geometry
+                        ELSE st_centroid(geometry)
+                    END as geometry
+                """
 
             insert_sql = f"""
                 INSERT INTO geo_embeddings ({insert_columns})
