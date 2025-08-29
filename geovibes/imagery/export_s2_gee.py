@@ -12,11 +12,11 @@ from typing import Dict, List, Optional
 import ee
 import geopandas as gpd
 import pandas as pd
-from shapely.geometry import shape
 from google.cloud import storage
 
-sys.path.append(str(Path(__file__).parent.parent))
-from ee_tools import initialize_ee_with_credentials, get_s2_cloud_masked_collection
+sys.path.append(str(Path(__file__).parent.parent.parent))
+from geovibes.ee_tools import initialize_ee_with_credentials, get_s2_cloud_masked_collection
+from geovibes.tiling import get_mgrs_tile_ids_for_roi_from_roi_file
 
 
 def load_mgrs_tiles(mgrs_file):
@@ -26,56 +26,6 @@ def load_mgrs_tiles(mgrs_file):
         return gdf
     except Exception as e:
         raise ValueError(f"Failed to load MGRS tiles from {mgrs_file}: {e}")
-
-
-def load_roi_geometry(roi_file):
-    """Load ROI geometry and return union of all geometries."""
-    try:
-        if roi_file.suffix.lower() in {'.gpq', '.parquet'}:
-            gdf = gpd.read_parquet(roi_file)
-        else:
-            gdf = gpd.read_file(roi_file)
-        
-        if gdf.empty:
-            raise ValueError("No geometries found in ROI file")
-        
-        # Ensure CRS is WGS84
-        if gdf.crs is None or gdf.crs.to_epsg() != 4326:
-            gdf = gdf.to_crs(4326)
-        
-        # Return union of all geometries
-        union_geom = gdf.union_all()
-        return union_geom
-        
-    except Exception as e:
-        raise ValueError(f"Failed to load ROI from {roi_file}: {e}")
-
-
-def find_intersecting_mgrs_tiles(mgrs_gdf, roi_geometry):
-    """Find all MGRS tiles that intersect with ROI geometry."""
-    # Ensure MGRS tiles are in WGS84
-    if mgrs_gdf.crs is None or mgrs_gdf.crs.to_epsg() != 4326:
-        mgrs_gdf = mgrs_gdf.to_crs(4326)
-    
-    # Create ROI GeoDataFrame for spatial join
-    roi_gdf = gpd.GeoDataFrame([1], geometry=[roi_geometry], crs="EPSG:4326")
-    
-    # Find intersecting tiles
-    intersecting = gpd.sjoin(mgrs_gdf, roi_gdf, how="inner", predicate="intersects")
-    
-    if intersecting.empty:
-        raise ValueError("No MGRS tiles intersect with the provided ROI")
-    
-    # Return list of tile info dictionaries
-    tiles = []
-    for _, row in intersecting.iterrows():
-        tiles.append({
-            'mgrs_code': row['mgrs_id'],
-            'geometry': row.geometry,
-            'epsg_code': row['epsg']
-        })
-    
-    return tiles
 
 
 def geometry_to_ee_feature(geometry):
@@ -96,6 +46,14 @@ def create_s2_composite(aoi_geometry, start_date, end_date, clear_threshold=0.80
         clear_threshold
     )
     
+    # Add NDVI and NDWI to each image in the collection
+    def add_indices(image):
+        ndvi = image.normalizedDifference(['B8', 'B4']).rename('NDVI')
+        ndwi = image.normalizedDifference(['B3', 'B8']).rename('NDWI')
+        return image.addBands(ndvi).addBands(ndwi)
+    
+    collection = collection.map(add_indices)
+    
     # Define the bands to export
     # Using the most commonly needed Sentinel-2 bands
     bands_to_export = [
@@ -111,21 +69,12 @@ def create_s2_composite(aoi_geometry, start_date, end_date, clear_threshold=0.80
         'B11',  # SWIR 1
         'B12'   # SWIR 2
     ]
+    bands_to_export.extend(['NDVI', 'NDWI'])
     
     # Create median composite
     composite = collection.select(bands_to_export).median()
+
     return composite, bands_to_export
-
-
-def detect_export_destination() -> str:
-    """Automatically detect whether to use Drive or Cloud Storage."""
-    try:
-        storage_client = storage.Client()
-        for bucket in storage_client.list_buckets(max_results=1):
-            return 'cloud'
-    except Exception:
-        pass
-    return 'drive'
 
 
 def export_band_to_drive(
@@ -183,6 +132,12 @@ def export_band_to_cloud_storage(
     )
     
     return task
+
+
+def check_gcs_file_exists(bucket, object_name: str) -> bool:
+    """Check if a file exists in Google Cloud Storage."""
+    blob = bucket.blob(object_name)
+    return blob.exists()
 
 
 def track_task_status(tasks: List[ee.batch.Task], check_interval: int = 30) -> Dict:
@@ -295,9 +250,10 @@ def main():
         description='Export cloud-masked Sentinel-2 composite bands for all MGRS tiles intersecting ROI'
     )
     parser.add_argument(
-        '--roi-file',
+        '--roi_file',
+        type=str,
         required=True,
-        help='Path to ROI file (GeoJSON, GeoParquet, or Shapefile)'
+        help="Path to a GeoJSON/GeoParquet file to filter MGRS tiles."
     )
     parser.add_argument(
         '--output-folder',
@@ -311,9 +267,9 @@ def main():
     )
     parser.add_argument(
         '--destination',
-        choices=['drive', 'cloud', 'auto'],
-        default='auto',
-        help='Export destination: drive, cloud, or auto-detect (default: auto)'
+        choices=['drive', 'cloud'],
+        default='cloud',
+        help='Export destination: drive or cloud (default: cloud)'
     )
     parser.add_argument(
         '--start-date',
@@ -338,9 +294,10 @@ def main():
         help='Export scale in meters (default: 10)'
     )
     parser.add_argument(
-        '--mgrs-file',
-        default='geometries/mgrs_tiles.parquet',
-        help='Path to MGRS geojson file (default: geometries/mgrs_tiles.parquet)'
+        '--mgrs_reference_file',
+        type=str,
+        default='./mgrs_tiles.parquet',
+        help="Path to GeoParquet file with MGRS tile geometries."
     )
     parser.add_argument(
         '--track-tasks',
@@ -354,28 +311,47 @@ def main():
         print("❌ Failed to initialize Earth Engine. Exiting.")
         return 1
     
-    if args.mgrs_file is None:
-        script_dir = Path(__file__).parent.parent.parent
-        args.mgrs_file = script_dir / 'geometries' / 'mgrs_tiles.parquet'
-    
     destination = args.destination
-    if destination == 'auto':
-        destination = detect_export_destination()
-        print(f"🤖 Auto-detected export destination: {destination}")
     
     if destination == 'cloud' and not args.bucket_name:
         print("❌ Cloud storage export requires --bucket-name argument")
         return 1
     
+    # Initialize GCS client if needed
+    gcs_bucket = None
+    if destination == 'cloud':
+        try:
+            storage_client = storage.Client()
+            gcs_bucket = storage_client.bucket(args.bucket_name)
+            print(f"✅ Connected to GCS bucket: {args.bucket_name}")
+        except Exception as e:
+            print(f"❌ Failed to connect to GCS bucket: {e}")
+            return 1
+    
     try:
-        print(f"🔍 Loading ROI geometry from {args.roi_file}")
-        roi_geometry = load_roi_geometry(Path(args.roi_file))
-        
-        print(f"🗺️  Loading MGRS tiles from {args.mgrs_file}")
-        mgrs_gdf = load_mgrs_tiles(args.mgrs_file)
-        
-        print("🎯 Finding intersecting MGRS tiles...")
-        intersecting_tiles = find_intersecting_mgrs_tiles(mgrs_gdf, roi_geometry)
+        print(f"🎯 Finding intersecting MGRS tiles for ROI: {args.roi_file}...")
+        intersecting_mgrs_ids = get_mgrs_tile_ids_for_roi_from_roi_file(
+            roi_geojson_file=args.roi_file,
+            mgrs_tiles_file=args.mgrs_reference_file,
+        )
+
+        if not intersecting_mgrs_ids:
+            raise ValueError("No MGRS tiles intersect with the provided ROI")
+
+        intersecting_mgrs_codes = [str(tile_id) for tile_id in intersecting_mgrs_ids]
+
+        print(f"🗺️  Loading MGRS tile geometries from {args.mgrs_reference_file}")
+        mgrs_gdf = load_mgrs_tiles(args.mgrs_reference_file)
+
+        intersecting_gdf = mgrs_gdf[mgrs_gdf['mgrs_id'].isin(intersecting_mgrs_codes)]
+
+        intersecting_tiles = []
+        for _, row in intersecting_gdf.iterrows():
+            intersecting_tiles.append({
+                'mgrs_code': row['mgrs_id'],
+                'geometry': row.geometry,
+                'epsg_code': row['epsg']
+            })
         
         print(f"📍 Found {len(intersecting_tiles)} intersecting MGRS tiles:")
         for tile in intersecting_tiles:
@@ -385,12 +361,11 @@ def main():
         print(f"☁️  Using CloudScore+ threshold: {args.clear_threshold}")
         
         all_tasks = []
-        total_exports = len(intersecting_tiles) * 11  # 11 bands per tile
         
         if destination == 'drive':
-            print(f"📤 Exporting {total_exports} band images to Google Drive folder: {args.output_folder}")
+            print(f"📤 Exporting band images to Google Drive folder: {args.output_folder}")
         else:
-            print(f"📤 Exporting {total_exports} band images to Cloud Storage: gs://{args.bucket_name}/{args.output_folder}")
+            print(f"📤 Exporting band images to Cloud Storage: gs://{args.bucket_name}/{args.output_folder}")
         
         for i, tile_info in enumerate(intersecting_tiles, 1):
             print(f"\n🔄 Processing tile {i}/{len(intersecting_tiles)}: {tile_info['mgrs_code']}")
@@ -406,6 +381,18 @@ def main():
             
             # Export each band for this tile
             for band_name in bands:
+                file_name = f"{tile_info['mgrs_code']}_{band_name}_{args.start_date}_{args.end_date}.tif"
+                
+                # Check if file exists
+                if destination == 'cloud' and gcs_bucket:
+                    object_name = f"{args.output_folder}/{file_name}"
+                    if check_gcs_file_exists(gcs_bucket, object_name):
+                        print(f"   ⏩ Skipping (exists): {file_name}")
+                        continue
+                elif destination == 'drive':
+                    # NOTE: Checking for existing files in Google Drive is not supported.
+                    pass
+
                 if destination == 'drive':
                     task = export_band_to_drive(
                         composite,
@@ -432,8 +419,12 @@ def main():
                         args.scale
                     )
                 all_tasks.append(task)
-                print(f"   📁 Queued: {tile_info['mgrs_code']}_{band_name}.tif")
+                print(f"   📁 Queued: {file_name}")
         
+        if not all_tasks:
+            print("\n✅ All files already exist. No new tasks to start.")
+            return 0
+
         # Start all tasks
         print(f"\n🚀 Starting {len(all_tasks)} export tasks...")
         for task in all_tasks:

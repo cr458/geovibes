@@ -4,12 +4,17 @@ import pathlib
 import sys
 from typing import List, Dict, Optional
 import os
+import io
+import re
 
 import geopandas as gpd
 import pandas as pd
 from shapely.ops import unary_union
 from tqdm import tqdm
 from joblib import Parallel, delayed
+import s3fs
+
+from geovibes.tiling import MGRSTileId, get_crs_from_mgrs_tile_id, get_mgrs_tile_ids_for_roi_from_roi_file
 
 
 def setup_logging():
@@ -34,37 +39,16 @@ def _load_region(path: str) -> gpd.GeoSeries:
     return gpd.GeoSeries([geom], crs="EPSG:4326")
 
 
-def get_intersecting_mgrs_ids(roi_path: str, mgrs_reference_path: str) -> Dict[str, str]:
-    """Find MGRS tiles that intersect with the given ROI and return a dict of tile_id: epsg_code."""
-    logging.info("Loading ROI and MGRS reference file...")
-    region_gs = _load_region(roi_path)
-    mgrs_gdf = gpd.read_parquet(mgrs_reference_path)
-
-    if mgrs_gdf.crs is None or mgrs_gdf.crs.to_epsg() != 4326:
-        mgrs_gdf = mgrs_gdf.to_crs(4326)
-
-    logging.info("Finding intersecting MGRS tiles...")
-    intersecting_tiles = gpd.sjoin(
-        mgrs_gdf, gpd.GeoDataFrame(geometry=region_gs), how="inner", predicate="intersects"
-    )
-
-    tile_id_col = "mgrs_id"
-    epsg_col = "epsg"
-    if tile_id_col not in intersecting_tiles.columns:
-        raise ValueError(f"MGRS reference file must have a '{tile_id_col}' column.")
-    if epsg_col not in intersecting_tiles.columns:
-        raise ValueError(f"MGRS reference file must have an '{epsg_col}' column.")
-
-    return dict(zip(intersecting_tiles[tile_id_col], intersecting_tiles[epsg_col]))
-
-
-def process_and_save_geojson(gcs_path: str, epsg_code: str, output_dir: str) -> Optional[str]:
+def process_and_save_geojson(gcs_path: str, epsg_code: str, output_dir: str, start_time: str, end_time: str, s3_endpoint: Optional[str] = None) -> Optional[str]:
     """
     Reads a GeoJSON from GCS, processes it, and saves it as a local GeoParquet file.
     """
     try:
-        output_filename = f"{pathlib.Path(gcs_path).stem}.parquet"
-        local_path = os.path.join(output_dir, output_filename)
+        stem = pathlib.Path(gcs_path).stem
+        m = re.match(r"^(?P<prefix>.+?)_\d{4}$", stem)
+        base = m.group("prefix") if m else stem
+        output_filename = f"{base}_{start_time}_{end_time}.parquet"
+        output_uri = f"{output_dir.rstrip('/')}" + "/" + output_filename
             
         gdf = gpd.read_file(gcs_path).drop(columns=["id"])
         if gdf.empty:
@@ -78,8 +62,9 @@ def process_and_save_geojson(gcs_path: str, epsg_code: str, output_dir: str) -> 
                 centroids.append(None)
                 continue
             
-            # Use the provided EPSG code for the projection
-            centroid_utm = gpd.GeoSeries([geom], crs="EPSG:4326").to_crs(f"EPSG:{epsg_code}").centroid
+            epsg_str = str(epsg_code)
+            target_crs = epsg_str if epsg_str.upper().startswith("EPSG:") else f"EPSG:{epsg_str}"
+            centroid_utm = gpd.GeoSeries([geom], crs="EPSG:4326").to_crs(target_crs).centroid
             centroid_wgs84 = centroid_utm.to_crs("EPSG:4326").iloc[0]
             centroids.append(centroid_wgs84)
 
@@ -107,9 +92,19 @@ def process_and_save_geojson(gcs_path: str, epsg_code: str, output_dir: str) -> 
         final_gdf = gdf[final_cols]
         
         # Save to local geoparquet file
-        final_gdf.to_parquet(local_path)
-        
-        return local_path
+        if output_dir.startswith("s3://"):
+            endpoint = s3_endpoint or "https://data.source.coop"
+            buffer = io.BytesIO()
+            final_gdf.to_parquet(buffer)
+            buffer.seek(0)
+            fs = s3fs.S3FileSystem(client_kwargs={"endpoint_url": endpoint}, config_kwargs={"s3": {"addressing_style": "path"}})
+            with fs.open(output_uri, "wb") as f:
+                f.write(buffer.read())
+            return output_uri
+        else:
+            pathlib.Path(output_dir).mkdir(parents=True, exist_ok=True)
+            final_gdf.to_parquet(output_uri)
+            return output_uri
     
     except Exception as e:
         logging.warning(f"Failed to process {gcs_path}: {e}")
@@ -119,10 +114,18 @@ def process_and_save_geojson(gcs_path: str, epsg_code: str, output_dir: str) -> 
 def main():
     parser = argparse.ArgumentParser(description="Convert Google Satellite GeoJSON files to GeoParquet format.")
     parser.add_argument("roi_file", help="Path to the ROI file (e.g., aoi.geojson).")
-    parser.add_argument("output_dir", help="Directory to save output files.")
+    parser.add_argument("output_dir", help="Directory to save output files. Can be local path or s3:// prefix.")
     parser.add_argument("--mgrs_reference_file", default="/Users/christopherren/geovibes/geometries/mgrs_tiles.parquet", help="Path to the MGRS grid reference file.")
     parser.add_argument("--gcs_bucket", default="geovibes", help="GCS bucket to use for the embeddings.")
+    parser.add_argument("--gcs_prefix", type=str, default="embeddings/google_satellite_v1", help="Base GCS prefix/folder within the bucket.")
+    parser.add_argument("--year", type=int, default=2024, help="The year for which to get the satellite embeddings (e.g., 2023).")
+    parser.add_argument("--tilesize", type=int, default=25, help="Tile size in pixels used to construct asset name.")
+    parser.add_argument("--overlap", type=int, default=0, help="Overlap in pixels used to construct asset name.")
+    parser.add_argument("--resolution", type=float, default=10.0, help="Resolution in meters per pixel used to construct asset name.")
     parser.add_argument("--workers", type=int, default=-1, help="Number of parallel workers for processing files.")
+    parser.add_argument("--start_time", type=str, default="2024-01-01", help="Start date appended to parquet filenames.")
+    parser.add_argument("--end_time", type=str, default="2025-01-01", help="End date appended to parquet filenames.")
+    parser.add_argument("--s3_endpoint", type=str, default="https://data.source.coop", help="S3 endpoint when output_dir is s3://.")
     args = parser.parse_args()
 
     setup_logging()
@@ -133,24 +136,27 @@ def main():
 
     try:
         # Find intersecting MGRS tiles and their EPSG codes
-        mgrs_epsg_map = get_intersecting_mgrs_ids(args.roi_file, args.mgrs_reference_file)
-        if not mgrs_epsg_map:
+        mgrs_tile_ids: list[MGRSTileId] = get_mgrs_tile_ids_for_roi_from_roi_file(args.roi_file, args.mgrs_reference_file)
+        if not mgrs_tile_ids:
             logging.info("No intersecting MGRS tiles found for the given ROI.")
             return
 
         local_parquet_files = []
         tasks_to_process = []
 
+        tiling_params_str = f"{args.tilesize}_{args.overlap}_{int(args.resolution)}"
+        full_gcs_prefix = f"{args.gcs_prefix}/{tiling_params_str}" if args.gcs_prefix else tiling_params_str
+
         logging.info("Checking for existing parquet files...")
-        for mgrs_id, epsg_code in mgrs_epsg_map.items():
-            expected_filename = f"{mgrs_id}_2024.parquet"
+        for mgrs_tile_id in mgrs_tile_ids:
+            expected_filename = f"{mgrs_tile_id}_{args.start_time}_{args.end_time}.parquet"
             local_path = output_path / expected_filename
 
-            if local_path.exists():
+            if not args.output_dir.startswith("s3://") and local_path.exists():
                 local_parquet_files.append(str(local_path))
             else:
-                gcs_path = f"gs://{args.gcs_bucket}/embeddings/google_satellite_v1/25_0_10/{mgrs_id}_2024.geojson"
-                tasks_to_process.append((gcs_path, epsg_code, args.output_dir))
+                gcs_path = f"gs://{args.gcs_bucket}/{full_gcs_prefix}/{mgrs_tile_id}_{args.year}.geojson"
+                tasks_to_process.append((gcs_path, get_crs_from_mgrs_tile_id(mgrs_tile_id), args.output_dir, args.start_time, args.end_time, args.s3_endpoint))
         
         logging.info(f"Found {len(local_parquet_files)} existing parquet files.")
         
@@ -160,7 +166,7 @@ def main():
             # Process and save GeoJSONs in parallel for missing files
             processed_files = Parallel(n_jobs=args.workers, verbose=20)(
                 delayed(process_and_save_geojson)(*task)
-                for task in tqdm(tasks_to_process, desc="Processing GeoJSON files")
+                for task in tasks_to_process
             )
 
             newly_processed_files = [f for f in processed_files if f is not None]
@@ -175,7 +181,7 @@ def main():
             logging.info(f"Successfully processed all {len(newly_processed_files)} missing files.")
 
         # Validate we have all expected files
-        expected_file_count = len(mgrs_epsg_map)
+        expected_file_count = len(mgrs_tile_ids)
         actual_file_count = len(local_parquet_files)
         
         if actual_file_count != expected_file_count:

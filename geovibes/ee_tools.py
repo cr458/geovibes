@@ -37,7 +37,7 @@ def initialize_ee_with_credentials(
 
 
 def get_s2_cloud_masked_collection(
-    aoi: ee.Geometry,
+    aoi: Optional[ee.Geometry],
     start_date: str = "2024-01-01",
     end_date: str = "2025-12-31",
     clear_threshold: float = 0.80,
@@ -45,7 +45,7 @@ def get_s2_cloud_masked_collection(
     """Get cloud-masked Sentinel-2 collection using CloudScore+ for quality filtering.
 
     Args:
-        aoi: Earth Engine geometry defining area of interest.
+        aoi: Earth Engine geometry defining area of interest. If None, no spatial filter is applied.
         start_date: Start date in YYYY-MM-DD format.
         end_date: End date in YYYY-MM-DD format.
         clear_threshold: CloudScore+ threshold (0-1) where 1 is clearest.
@@ -57,16 +57,18 @@ def get_s2_cloud_masked_collection(
     csPlus = ee.ImageCollection("GOOGLE/CLOUD_SCORE_PLUS/V1/S2_HARMONIZED")
     QA_BAND = "cs_cdf"
 
+    collection = s2.filterDate(start_date, end_date)
+    if aoi:
+        collection = collection.filterBounds(aoi)
+
     return (
-        s2.filterBounds(aoi)
-        .filterDate(start_date, end_date)
-        .linkCollection(csPlus, [QA_BAND])
+        collection.linkCollection(csPlus, [QA_BAND])
         .map(lambda img: img.updateMask(img.select(QA_BAND).gte(clear_threshold)))
     )
 
 
 def get_s2_rgb_median(
-    aoi: ee.Geometry,
+    aoi: Optional[ee.Geometry],
     start_date: str = "2024-01-01",
     end_date: str = "2025-12-31",
     clear_threshold: float = 0.80,
@@ -74,7 +76,7 @@ def get_s2_rgb_median(
     """Create median RGB composite from cloud-masked Sentinel-2 imagery.
 
     Args:
-        aoi: Earth Engine geometry defining area of interest.
+        aoi: Earth Engine geometry defining area of interest. If None, no spatial filter is applied.
         start_date: Start date in YYYY-MM-DD format.
         end_date: End date in YYYY-MM-DD format.
         clear_threshold: CloudScore+ threshold (0-1) for pixel quality.
@@ -89,7 +91,7 @@ def get_s2_rgb_median(
 
 
 def get_s2_ndvi_median(
-    aoi: ee.Geometry,
+    aoi: Optional[ee.Geometry],
     start_date: str = "2024-01-01",
     end_date: str = "2025-12-31",
     clear_threshold: float = 0.80,
@@ -97,7 +99,7 @@ def get_s2_ndvi_median(
     """Create median NDVI from cloud-masked Sentinel-2 imagery.
 
     Args:
-        aoi: Earth Engine geometry defining area of interest.
+        aoi: Earth Engine geometry defining area of interest. If None, no spatial filter is applied.
         start_date: Start date in YYYY-MM-DD format.
         end_date: End date in YYYY-MM-DD format.
         clear_threshold: CloudScore+ threshold (0-1) for pixel quality.
@@ -115,7 +117,7 @@ def get_s2_ndvi_median(
 
 
 def get_s2_ndwi_median(
-    aoi: ee.Geometry,
+    aoi: Optional[ee.Geometry],
     start_date: str = "2024-01-01",
     end_date: str = "2025-12-31",
     clear_threshold: float = 0.80,
@@ -123,7 +125,7 @@ def get_s2_ndwi_median(
     """Create median NDWI from cloud-masked Sentinel-2 imagery.
 
     Args:
-        aoi: Earth Engine geometry defining area of interest.
+        aoi: Earth Engine geometry defining area of interest. If None, no spatial filter is applied.
         start_date: Start date in YYYY-MM-DD format.
         end_date: End date in YYYY-MM-DD format.
         clear_threshold: CloudScore+ threshold (0-1) for pixel quality.
@@ -141,7 +143,7 @@ def get_s2_ndwi_median(
 
 
 def get_s2_hsv_median(
-    aoi: ee.Geometry,
+    aoi: Optional[ee.Geometry],
     start_date: str = "2023-01-01",
     end_date: str = "2024-12-31",
     clear_threshold: float = 0.80,
@@ -149,7 +151,7 @@ def get_s2_hsv_median(
     """Create median HSV composite from cloud-masked Sentinel-2 imagery.
 
     Args:
-        aoi: Earth Engine geometry defining area of interest.
+        aoi: Earth Engine geometry defining area of interest. If None, no spatial filter is applied.
         start_date: Start date in YYYY-MM-DD format.
         end_date: End date in YYYY-MM-DD format.
         clear_threshold: CloudScore+ threshold (0-1) for pixel quality.

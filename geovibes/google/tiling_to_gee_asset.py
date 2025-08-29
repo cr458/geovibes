@@ -19,8 +19,7 @@ import shapely.ops
 from google.cloud import storage
 from joblib import Parallel, delayed
 
-from geovibes.tiling import MGRSTileGrid, chip_mgrs_tile, get_crs_from_tile
-
+from geovibes.tiling import MGRSTileGrid, MGRSTileId, chip_mgrs_tile
 
 def write_tiles_to_geoparquet(
     tiles: gpd.GeoDataFrame, tile_name: str, output_dir: str = "."
@@ -52,6 +51,16 @@ def check_gcs_file_exists(gcs_bucket: str, blob_name: str) -> bool:
     except Exception as e:
         print(f"    Warning: Could not check GCS file existence: {e}")
         return False
+
+
+def check_gcs_bucket_access(gcs_bucket_name: str) -> tuple[bool, str]:
+    """Checks for read access to a GCS bucket."""
+    try:
+        storage_client = storage.Client()
+        storage_client.get_bucket(gcs_bucket_name)
+        return (True, f"✅ Access to GCS bucket '{gcs_bucket_name}' confirmed.")
+    except Exception as e:
+        return (False, f"❌ Failed to access GCS bucket '{gcs_bucket_name}': {str(e)}")
 
 
 def create_local_shapefile_zip(
@@ -257,10 +266,9 @@ def process_single_tile(
     try:
         if debug:
             print(f"Processing MGRS tile: {tile_id}")
-        crs = get_crs_from_tile(tile_series)
+        mgrs_tile_id = MGRSTileId.from_str(tile_id)
         grid = MGRSTileGrid(
-            mgrs_tile_id=tile_id,
-            crs=crs,
+            mgrs_tile_id=mgrs_tile_id,
             tilesize=tilesize,
             overlap=overlap,
             resolution=resolution,
@@ -445,6 +453,24 @@ EXAMPLE:
 
     os.makedirs(args.output_dir, exist_ok=True)
 
+    if args.gcs_bucket and args.gee_asset_path:
+        print("\n" + "=" * 80)
+        print("PHASE 0: PRE-FLIGHT CHECKS")
+        print("=" * 80)
+        gcs_ok, gcs_message = check_gcs_bucket_access(args.gcs_bucket)
+        print(gcs_message)
+        if not gcs_ok:
+            print("Please resolve GCS access issues before proceeding.")
+            return
+
+        auth_ok, auth_message = check_earthengine_auth()
+        print(f"✅ {auth_message}" if auth_ok else f"❌ {auth_message}")
+        if not auth_ok:
+            print(
+                "Please resolve authentication issues before proceeding with GEE asset creation."
+            )
+            return
+
     try:
         if args.mgrs_tile_file.endswith(".parquet"):
             mgrs_gdf = gpd.read_parquet(args.mgrs_tile_file)
@@ -526,7 +552,6 @@ EXAMPLE:
     print("PHASE 1 SUMMARY")
     print("=" * 80)
 
-    successful_tiles = [r for r in results if r["success"]]
     failed_tiles = [r for r in results if not r["success"]]
     skipped_local = [
         r
@@ -602,16 +627,6 @@ EXAMPLE:
         print("\n" + "=" * 80)
         print("PHASE 3: CREATING GEE ASSETS")
         print("=" * 80)
-
-        auth_success, auth_message = check_earthengine_auth()
-        if not auth_success:
-            print(f"❌ {auth_message}")
-            print(
-                "Please resolve authentication issues before proceeding with GEE asset creation."
-            )
-            return
-        else:
-            print(f"✅ {auth_message}")
 
         gee_results = []
         for item in files_for_gee_creation:

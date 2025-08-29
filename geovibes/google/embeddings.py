@@ -4,54 +4,7 @@ import geopandas as gpd
 import pandas as pd
 from dataclasses import dataclass, field
 
-@dataclass
-class MGRSTileGrid:
-    """Class for tracking a MGRS tile grid"""
-    mgrs_tile_id: str
-    crs: str
-    tilesize: int
-    overlap: int
-    resolution: float
-    prefix: str = field(init=False)
-
-    def __post_init__(self):
-        self.prefix = f"{self.mgrs_tile_id}_{self.crs.split(':')[-1]}_{self.tilesize}_{self.overlap}_{int(self.resolution)}"
-
-def get_crs_from_tile(tile_series: pd.Series) -> str:
-    """Get the CRS from a tile series by reading the 'epsg' column."""
-    try:
-        epsg_code = tile_series['epsg']
-        return f"EPSG:{epsg_code}"
-    except KeyError:
-        raise ValueError("Input series must have an 'epsg' column.")
-
-def find_intersecting_mgrs_tiles(roi_file: str, mgrs_reference_file: str) -> gpd.GeoDataFrame:
-    """Find MGRS tiles that intersect with the given ROI."""
-    print(f"Loading MGRS reference from: {mgrs_reference_file}")
-    if mgrs_reference_file.endswith(".parquet"):
-        mgrs_gdf = gpd.read_parquet(mgrs_reference_file)
-    elif mgrs_reference_file.endswith(".geojson"):
-        mgrs_gdf = gpd.read_file(mgrs_reference_file)
-    else:
-        raise ValueError("MGRS reference file must be a .parquet or .geojson file.")
-
-    print(f"Filtering MGRS tiles by ROI: {roi_file}")
-    if roi_file.endswith(".parquet"):
-        roi_gdf = gpd.read_parquet(roi_file)
-    elif roi_file.endswith(".geojson"):
-        roi_gdf = gpd.read_file(roi_file)
-    else:
-        raise ValueError("ROI file must be a .parquet or .geojson file.")
-
-    if mgrs_gdf.crs != roi_gdf.crs:
-        print(f"Warning: MGRS CRS ({mgrs_gdf.crs}) and ROI CRS ({roi_gdf.crs}) differ. Reprojecting ROI.")
-        roi_gdf = roi_gdf.to_crs(mgrs_gdf.crs)
-
-    roi_geometry = roi_gdf.union_all()
-    intersecting_mask = mgrs_gdf.intersects(roi_geometry)
-    intersecting_gdf = mgrs_gdf[intersecting_mask]
-    print(f"Found {len(intersecting_gdf)} MGRS tiles intersecting with the ROI.")
-    return intersecting_gdf
+from geovibes.tiling import MGRSTileId, MGRSTileGrid, get_mgrs_tile_ids_for_roi_from_roi_file
 
 def aggregate_satellite_embeddings(
     roi_file: str,
@@ -73,13 +26,13 @@ def aggregate_satellite_embeddings(
     except Exception as e:
         raise RuntimeError("Could not initialize Earth Engine. Please ensure you have authenticated.") from e
 
-    intersecting_tiles_gdf = find_intersecting_mgrs_tiles(roi_file, mgrs_reference_file)
+    mgrs_tile_ids: list[MGRSTileId] = get_mgrs_tile_ids_for_roi_from_roi_file(roi_file, mgrs_reference_file)
 
-    if intersecting_tiles_gdf.empty:
+    if not mgrs_tile_ids:
         print("No intersecting MGRS tiles found. Exiting.")
         return
 
-    print(f"\nFound {len(intersecting_tiles_gdf)} tiles to process. Starting export tasks...")
+    print(f"\nFound {len(mgrs_tile_ids)} tiles to process. Starting export tasks...")
 
     # Load the Google Satellite Embedding collection for the specified year.
     start_date = f'{year}-01-01'
@@ -103,12 +56,10 @@ def aggregate_satellite_embeddings(
         )
         return feature.set(stats)
 
-    for _, tile_series in intersecting_tiles_gdf.iterrows():
+    for mgrs_tile_id in mgrs_tile_ids:
         # 1. Construct asset ID
-        crs = get_crs_from_tile(tile_series)
         grid = MGRSTileGrid(
-            mgrs_tile_id=tile_series.mgrs_id,
-            crs=crs,
+            mgrs_tile_id=mgrs_tile_id,
             tilesize=tilesize,
             overlap=overlap,
             resolution=resolution,

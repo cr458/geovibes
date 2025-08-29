@@ -1,0 +1,40 @@
+---
+description: Configuration files and project documentation standards
+---
+
+# Configuration and Documentation Standards
+
+## Project Configuration
+- Use [pyproject.toml](mdc:pyproject.toml) for Python project configuration
+- Environment settings should be in [config.yaml](mdc:config.yaml)
+- Modal inference configurations are in [config/](mdc:config/) directory
+- Reference existing patterns in [config/inference/](mdc:config/inference/) for ML model configs
+
+## Documentation Approach
+- Keep documentation minimal and focused
+- All documentation should be in code docstrings, not separate markdown files
+- [README.md](mdc:README.md) should only contain essential project information
+- DO NOT create additional documentation files unless explicitly requested
+
+## Build and Deployment
+- Use [Makefile](mdc:Makefile) for common development tasks
+- Follow patterns established in [run.py](mdc:run.py) for application entry points
+- Ensure compatibility with conda environment 'geovibes'
+
+## Version Control and Ignores
+- Follow patterns in [.gitignore](mdc:.gitignore) for what to exclude
+- Be mindful of large data files and model artifacts
+- Use appropriate patterns for Jupyter notebook outputs
+
+## Development Guidelines
+- Configuration should be environment-aware (local vs cloud)
+- Use type hints in configuration parsing code
+- Validate configuration inputs at startup
+- Keep secrets and credentials out of version control
+
+## Project Structure Reference
+- Main application entry: [run.py](mdc:run.py)
+- Core modules: [geovibes/](mdc:geovibes/) directory
+- Notebooks for analysis: [notebooks/](mdc:notebooks/) directory
+- Data storage: [embeddings/](mdc:embeddings/), [geometries/](mdc:geometries/), [databases/](mdc:databases/)
+- Build artifacts: excluded via [.gitignore](mdc:.gitignore)

@@ -1,0 +1,45 @@
+---
+globs: *.ipynb
+---
+
+# Jupyter Notebook Standards for Geovibes
+
+## Notebook Structure and Organization
+- Keep notebook cells focused and atomic
+- Use markdown cells for section headers and explanations
+- Import all required libraries in the first cell
+- Never add inline comments unless explicitly requested
+- Include progress logging for long-running operations
+
+## Data Processing in Notebooks
+- Implement parallel processing for I/O-heavy operations
+- Use `ThreadPoolExecutor` or `ProcessPoolExecutor` for concurrent tasks
+- Display progress bars and timing information for long operations
+- Always save intermediate results to avoid re-computation
+
+## Integration with Geovibes Modules
+- Reference main modules using relative imports: `sys.path.append('..')`
+- Use functions from [tiling.py](mdc:geovibes/tiling.py) for MGRS operations
+- Leverage existing utilities in [geovibes/](mdc:geovibes/) directory
+
+## Memory Management and Performance
+- Clear large variables when no longer needed using `del variable_name`
+- Use `memory_usage(deep=True)` to monitor DataFrame memory consumption
+- Process data in chunks for large datasets
+- Implement sampling for visualization when datasets are too large
+
+## Output and Results
+- Create comprehensive summary statistics and visualizations
+- Save results in multiple formats (CSV, Parquet, GeoParquet)
+- Include data quality checks and validation
+- Export combined datasets for further analysis
+
+## Error Handling in Notebooks
+- DO NOT use try/except blocks during development phases
+- Use comprehensive logging instead: `logging.info()`, `logging.warning()`
+- Only add error handling when explicitly moving to production
+
+## Environment Setup
+- Always check conda environment: `conda activate geovibes`
+- Configure logging at the beginning of notebooks
+- Set random seeds for reproducibility when applicable

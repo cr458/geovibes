@@ -44,9 +44,6 @@ class UIConstants:
     RESET_BUTTON_HEIGHT = '35px'
     COLLAPSE_BUTTON_SIZE = '25px'
     
-    # Click threshold for point selection
-    CLICK_THRESHOLD = 0.001
-    
     # Label values
     POSITIVE_LABEL = 1
     NEGATIVE_LABEL = 0
@@ -131,6 +128,12 @@ class BasemapConfig:
         'palette': ['brown', 'white', 'blue']
     }
 
+    S2_HSV_VIS_PARAMS = {
+        'min': 0,
+        'max': 1,
+        'bands': ['hue', 'saturation', 'value']
+    }
+
 
 class DatabaseConstants:
     """Database-related constants."""
@@ -144,6 +147,7 @@ class DatabaseConstants:
     INSTALL httpfs;
     LOAD httpfs;
     """
+
     
     @classmethod
     def get_memory_setup_queries(cls):
@@ -151,12 +155,15 @@ class DatabaseConstants:
         return [
             f"SET memory_limit='{cls.MEMORY_LIMIT}'",
             f"SET max_memory='{cls.MAX_MEMORY}'",
-            f"SET temp_directory='{cls.TEMP_DIRECTORY}'"
+            f"SET temp_directory='{cls.TEMP_DIRECTORY}'",
+            # Disable progress bar to prevent Jupyter crashes with UTINYINT[] arrays
+            "SET enable_progress_bar=false",
+            "SET enable_profiling=no_output"
         ]
     
     @classmethod
     def get_extension_setup_queries(cls, duckdb_path: str):
-        """Get extension setup queries based on database path.
+        """Get extension setup queries based on database path and index type.
         
         Args:
             duckdb_path: Path to DuckDB database (local or GCS)
@@ -257,8 +264,8 @@ class DatabaseConstants:
                 pass
     
     # Memory configuration
-    MEMORY_LIMIT = '12GB'
-    MAX_MEMORY = '12GB'
+    MEMORY_LIMIT = '24GB'
+    MAX_MEMORY = '24GB'
     TEMP_DIRECTORY = '/tmp'
     
     # Chunk size for embedding fetching to avoid memory issues
@@ -290,60 +297,6 @@ class DatabaseConstants:
             raise ValueError(f"Could not detect embedding dimension: {e}")
     
     @staticmethod
-    def detect_embedding_dimension_from_parquet(parquet_path: str, embedding_column: str = 'embedding') -> int:
-        """Detect embedding dimension from parquet file.
-        
-        Args:
-            parquet_path: Path to parquet file
-            embedding_column: Name of embedding column (default: 'embedding')
-            
-        Returns:
-            int: Embedding dimension
-            
-        Raises:
-            ValueError: If no embeddings found or dimension cannot be detected
-        """
-        try:
-            import pandas as pd
-            
-            # Read just the first row
-            df = pd.read_parquet(parquet_path, nrows=1)
-            
-            if embedding_column not in df.columns:
-                raise ValueError(f"Embedding column '{embedding_column}' not found in parquet file")
-            
-            embedding = df[embedding_column].iloc[0]
-            if hasattr(embedding, '__len__'):
-                return len(embedding)
-            else:
-                raise ValueError(f"Embedding in column '{embedding_column}' is not array-like")
-                
-        except Exception as e:
-            raise ValueError(f"Could not detect embedding dimension from parquet: {e}")
-    
-    @staticmethod
-    def get_similarity_search_query(embedding_dim: int) -> str:
-        """Generate similarity search query with embeddings for given dimension.
-        
-        Args:
-            embedding_dim: Dimension of the embeddings
-            
-        Returns:
-            str: SQL query string
-        """
-        return f"""
-        WITH query(vec) AS (SELECT CAST(? AS FLOAT[{embedding_dim}]))
-        SELECT  g.id,
-                g.embedding,
-                ST_AsGeoJSON(g.geometry) AS geometry_json,
-                ST_AsText(g.geometry) AS geometry_wkt,
-                array_distance(g.embedding, q.vec) AS distance
-        FROM    geo_embeddings AS g, query AS q
-        ORDER BY distance
-        LIMIT ?;
-        """
-    
-    @staticmethod
     def get_similarity_search_light_query(embedding_dim: int) -> str:
         """Generate lightweight similarity search query for given dimension.
         
@@ -368,50 +321,6 @@ class DatabaseConstants:
             LIMIT ?
         ) g;
         """
-    
-    # Legacy constants for backward compatibility (deprecated)
-    @property
-    def EMBEDDING_DIM(self):
-        """Deprecated: Use detect_embedding_dimension() instead."""
-        import warnings
-        warnings.warn(
-            "EMBEDDING_DIM is deprecated. Use detect_embedding_dimension() instead.",
-            DeprecationWarning,
-            stacklevel=2
-        )
-        return 1000  # Default fallback
-    
-    @property 
-    def SIMILARITY_SEARCH_QUERY(self):
-        """Deprecated: Use get_similarity_search_query() instead."""
-        import warnings
-        warnings.warn(
-            "SIMILARITY_SEARCH_QUERY is deprecated. Use get_similarity_search_query() instead.",
-            DeprecationWarning,
-            stacklevel=2
-        )
-        return self.get_similarity_search_query(1000)
-    
-    @property
-    def SIMILARITY_SEARCH_LIGHT_QUERY(self):
-        """Deprecated: Use get_similarity_search_light_query() instead."""
-        import warnings
-        warnings.warn(
-            "SIMILARITY_SEARCH_LIGHT_QUERY is deprecated. Use get_similarity_search_light_query() instead.",
-            DeprecationWarning,
-            stacklevel=2
-        )
-        return self.get_similarity_search_light_query(1000)
-
-    # Nearest point query without embedding (memory-efficient)
-    NEAREST_POINT_LIGHT_QUERY = """
-    SELECT  g.id,
-            ST_AsText(g.geometry) AS wkt,
-            ST_Distance(geometry, ST_Point(?, ?)) AS dist_m
-    FROM    geo_embeddings g
-    ORDER BY dist_m
-    LIMIT   1
-    """
     
     # Original nearest point query with embedding (kept for backward compatibility)
     NEAREST_POINT_QUERY = """
@@ -491,5 +400,4 @@ class LayerStyles:
                 "fillOpacity": 0.5
             }
         } 
-
 

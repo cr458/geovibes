@@ -1,0 +1,43 @@
+---
+globs: geovibes/*.py
+---
+
+# Geovibes Module Development Standards
+
+## Module Architecture
+- Follow the existing structure in [geovibes/](mdc:geovibes/) directory
+- Core tiling functionality is in [tiling.py](mdc:geovibes/tiling.py)
+- Geospatial utilities are in [geotiff/](mdc:geovibes/geotiff/) subdirectory
+- Google Earth Engine tools are in [google/](mdc:geovibes/google/) subdirectory
+
+## MGRS and Tiling Operations
+- Use existing classes: `MGRSTileId`, `MGRSTileGrid` from [tiling.py](mdc:geovibes/tiling.py)
+- Leverage `get_mgrs_tile_ids_for_roi()` and `get_mgrs_tile_ids_for_roi_from_roi_file()`
+- Follow the pattern established in `chip_mgrs_tile()` function
+- Always use proper CRS handling with pyproj
+
+## Database Integration
+- Reference [database.py](mdc:geovibes/database.py) for database operations
+- Use DuckDB for spatial queries when appropriate
+- Follow established patterns for spatial indexing
+
+## Geospatial Data Processing
+- Use GeoPandas for vector data operations
+- Ensure proper CRS transformations between datasets
+- Leverage existing utilities in [utils.py](mdc:geovibes/utils.py)
+
+## UI and Configuration
+- UI components should reference [ui.py](mdc:geovibes/ui.py)
+- Configuration settings should use [ui_config/](mdc:geovibes/ui_config/) modules
+- Follow the pattern in [ui_config/settings.py](mdc:geovibes/ui_config/settings.py)
+
+## Module Dependencies
+- Keep dependencies minimal and well-defined
+- Use type hints consistently across all modules
+- Maintain compatibility with existing function signatures
+- Document all public APIs with comprehensive docstrings
+
+## Testing and Validation
+- Reference existing test patterns in [tests/](mdc:geovibes/tests/) directory
+- Validate MGRS tile operations against known test cases
+- Ensure coordinate system transformations are accurate

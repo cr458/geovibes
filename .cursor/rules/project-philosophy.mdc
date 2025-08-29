@@ -1,0 +1,34 @@
+---
+alwaysApply: true
+---
+
+# Geovibes Project Philosophy and Standards
+
+## Core Principles
+- Strictly follow the Zen of Python (PEP 20)
+- Prefer explicit over implicit
+- Simple is better than complex
+- Readability counts
+- Flat is better than nested
+- Sparse is better than dense
+
+## Development Environment
+- Default assumption: Working on GCP cloud VMs or Modal serverless compute
+- Always ensure conda environment 'geovibes' is activated: `conda activate geovibes`
+- Ask for clarification if deployment environment affects implementation
+
+## Performance Focus
+- Actively consider and implement parallelization for I/O-heavy tasks
+- Use appropriate libraries (multiprocessing, concurrent.futures, asyncio, etc.)
+- Design with cloud-scale performance in mind
+
+## Path Handling
+- Always use `os.path.join()`, `pathlib.Path`, or similar for path operations
+- Never use string concatenation or manipulation for file paths
+- Use platform-independent path handling
+
+## Output Standards
+- DO NOT generate explanatory markdown files after completing tasks
+- DO NOT create README files unless explicitly requested
+- DO NOT generate example or demo scripts after completing tasks
+- Focus on delivering the requested functionality only

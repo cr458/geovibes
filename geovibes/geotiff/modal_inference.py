@@ -10,6 +10,7 @@ import tempfile
 from typing import Optional, List
 from pathlib import Path
 
+from geovibes.tiling import get_mgrs_tile_ids_for_roi_from_roi_file
 import modal
 from modal import Secret
 import geopandas as gpd
@@ -55,34 +56,6 @@ image = (
     ])
     .add_local_dir("src/geotiff", "/root/geotiff")
 )
-
-
-def get_mgrs_tiles_from_roi(roi_file: str, mgrs_tiles_file: str = "geometries/mgrs_tiles.parquet") -> List[str]:
-    """Intersect ROI with MGRS tiles to get list of MGRS tile IDs to process."""
-    logger.info(f"Loading ROI from: {roi_file}")
-    roi_gdf = gpd.read_file(roi_file)
-    
-    logger.info(f"Loading MGRS tiles from: {mgrs_tiles_file}")
-    mgrs_gdf = gpd.read_parquet(mgrs_tiles_file)
-    
-    # Ensure both are in the same CRS
-    if roi_gdf.crs is not None and mgrs_gdf.crs is not None and roi_gdf.crs != mgrs_gdf.crs:
-        logger.info(f"Converting ROI from {roi_gdf.crs} to {mgrs_gdf.crs}")
-        roi_gdf = roi_gdf.to_crs(mgrs_gdf.crs)
-    elif roi_gdf.crs is None:
-        logger.warning("ROI file has no CRS defined")
-    elif mgrs_gdf.crs is None:
-        logger.warning("MGRS tiles file has no CRS defined")
-    
-    # Get union of all ROI geometries
-    roi_union = roi_gdf.unary_union
-
-    intersecting = mgrs_gdf[mgrs_gdf.intersects(roi_union)]
-    
-    mgrs_ids = intersecting[MGRS_ID_COLUMN].tolist()
-    logger.info(f"Found {len(mgrs_ids)} MGRS tiles intersecting with ROI: {mgrs_ids}")
-    
-    return mgrs_ids
 
 
 def find_tileset_for_mgrs(mgrs_id: str, tiles_dir: str) -> Optional[str]:
@@ -361,7 +334,8 @@ def main(
     if roi_file:
         logger.info(f"Determining MGRS tiles from ROI file: {roi_file}")
         mgrs_tiles_file = config_params.get("mgrs_tiles_file", "geometries/mgrs_tiles.parquet")
-        mgrs_ids = get_mgrs_tiles_from_roi(roi_file, mgrs_tiles_file)
+        mgrs_tile_ids = get_mgrs_tile_ids_for_roi_from_roi_file(roi_file, mgrs_tiles_file)
+        mgrs_ids = [str(mgrs_tile_id) for mgrs_tile_id in mgrs_tile_ids]
     else:
         # Fall back to explicit mgrs_ids from config
         mgrs_ids = config_params.get("mgrs_ids")
