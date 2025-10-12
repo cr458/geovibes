@@ -1,5 +1,6 @@
 import argparse
 import json
+import math
 from pathlib import Path
 
 import duckdb
@@ -9,6 +10,7 @@ import pandas as pd
 from shapely import wkb
 from shapely.ops import unary_union
 from sklearn.ensemble import RandomForestClassifier
+from tqdm import tqdm
 
 
 def parse_args():
@@ -20,6 +22,8 @@ def parse_args():
     parser.add_argument("--output", required=True)
     parser.add_argument("--keep-tiles", action="store_true")
     parser.add_argument("--tiles-output")
+    parser.add_argument("--chunk-size", type=int, default=5000)
+    parser.add_argument("--raw-chunks-output")
     return parser.parse_args()
 
 
@@ -57,18 +61,26 @@ def train_classifier(features, labels):
     return model
 
 
-def fetch_embeddings(con, table):
-    query = f"SELECT tile_id, embedding, geometry FROM {table}"
-    df = con.execute(query).fetch_df()
-    if df.empty:
-        raise ValueError("No records found in the embeddings table.")
-    return df
+def iterate_embedding_batches(con, table, chunk_size):
+    query = f"SELECT tile_id, embedding, ST_AsWKB(geometry) AS geometry FROM {table}"
+    con.execute(query)
+    while True:
+        chunk = con.fetch_df_chunk(chunk_size)
+        if chunk is None or chunk.empty:
+            break
+        yield chunk
 
 
 def build_tile_geodataframe(df, probabilities):
-    embeddings = df["embedding"].tolist()
     geoms = df["geometry"].tolist()
-    parsed_geoms = [wkb.loads(g) if isinstance(g, (bytes, bytearray, memoryview)) else g for g in geoms]
+    parsed_geoms = []
+    for g in geoms:
+        if g is None:
+            parsed_geoms.append(None)
+        elif isinstance(g, (bytes, bytearray, memoryview)):
+            parsed_geoms.append(wkb.loads(bytes(g)))
+        else:
+            parsed_geoms.append(g)
     data = {
         "tile_id": df["tile_id"].tolist(),
         "probability": probabilities.tolist(),
@@ -112,28 +124,103 @@ def dissolve_tiles(tile_gdf):
 
 
 def main():
+    import logging
+    logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+    logger = logging.getLogger(__name__)
+    
     args = parse_args()
+    logger.info(f"Connecting to DuckDB database: {args.duckdb_path}")
     con = duckdb.connect(args.duckdb_path, read_only=True)
     try:
+        logger.info("Loading spatial extension")
+        try:
+            con.execute("INSTALL spatial")
+        except duckdb.Error:
+            pass
+        con.execute("LOAD spatial")
+        
+        logger.info(f"Detecting feature dimensions for table: {args.table}")
         feature_dim = detect_feature_dim(con, args.table)
+        logger.info(f"Feature dimension detected: {feature_dim}")
+        
+        logger.info(f"Loading training data from: {args.training_set}")
         features, labels = ensure_training_data(args.training_set, feature_dim)
+        logger.info(f"Training data loaded: {len(features)} samples")
+        
+        logger.info("Training classifier")
         model = train_classifier(features, labels)
-        df = fetch_embeddings(con, args.table)
+        logger.info("Classifier training completed")
+        
+        logger.info(f"Counting total rows in table: {args.table}")
+        total_rows = con.execute(f"SELECT COUNT(*) FROM {args.table}").fetchone()[0]
+        logger.info(f"Total rows to process: {total_rows}")
+        if total_rows == 0:
+            raise ValueError("No records found in the embeddings table.")
+
+        if args.raw_chunks_output:
+            raw_chunks_dir = Path(args.raw_chunks_output)
+            raw_chunks_dir.mkdir(parents=True, exist_ok=True)
+            logger.info(f"Raw chunks will be saved to: {raw_chunks_dir}")
+
+        logger.info("Starting batch processing and classification")
+        filtered_chunks = []
+        chunk_counter = 0
+        total_chunks = max(1, math.ceil(total_rows / args.chunk_size))
+        logger.info("Estimated chunk count: %s", total_chunks)
+        for chunk in tqdm(
+            iterate_embedding_batches(con, args.table, args.chunk_size), total=total_chunks
+        ):
+            vectors = np.asarray(chunk["embedding"].tolist(), dtype=np.float32)
+            probabilities = model.predict_proba(vectors)[:, 1]
+            chunk_gdf = build_tile_geodataframe(chunk, probabilities)
+            
+            if args.raw_chunks_output:
+                chunk_path = raw_chunks_dir / f"chunk_{chunk_counter:06d}.parquet"
+                chunk_gdf.to_parquet(chunk_path)
+                chunk_counter += 1
+            
+            chunk_filtered = chunk_gdf[chunk_gdf["probability"] >= args.threshold].reset_index(drop=True)
+            if not chunk_filtered.empty:
+                filtered_chunks.append(chunk_filtered)
+
     finally:
         con.close()
-    embeddings = [np.asarray(row, dtype=np.float32) for row in df["embedding"].tolist()]
-    feature_matrix = np.vstack(embeddings)
-    probabilities = model.predict_proba(feature_matrix)[:, 1]
-    tile_gdf = build_tile_geodataframe(df, probabilities)
-    filtered_tiles = tile_gdf[tile_gdf["probability"] >= args.threshold].reset_index(drop=True)
+        logger.info("Database connection closed")
+    
+    if args.raw_chunks_output:
+        logger.info(f"Saved {chunk_counter} raw chunks to: {raw_chunks_dir}")
+    
+    logger.info("Combining filtered chunks")
+    if filtered_chunks:
+        filtered_tiles = gpd.GeoDataFrame(
+            pd.concat(filtered_chunks, ignore_index=True),
+            geometry="geometry",
+            crs=filtered_chunks[0].crs,
+        )
+        logger.info(f"Total filtered tiles: {len(filtered_tiles)}")
+    else:
+        filtered_tiles = gpd.GeoDataFrame(
+            {"tile_id": pd.Series(dtype=str), "probability": pd.Series(dtype=float)},
+            geometry=gpd.GeoSeries([], crs="EPSG:4326"),
+        )
+        logger.info("No tiles passed the threshold filter")
+    
+    logger.info("Dissolving tiles into contiguous regions")
     dissolved = dissolve_tiles(filtered_tiles)
     dissolved["threshold"] = args.threshold
+    logger.info(f"Created {len(dissolved)} dissolved regions")
+    
+    logger.info(f"Saving dissolved results to: {args.output}")
     Path(args.output).parent.mkdir(parents=True, exist_ok=True)
     dissolved.to_parquet(args.output)
+    
     if args.keep_tiles:
         output_path = Path(args.output)
         tiles_path = Path(args.tiles_output) if args.tiles_output else output_path.with_name(f"{output_path.stem}_tiles.parquet")
+        logger.info(f"Saving individual tiles to: {tiles_path}")
         filtered_tiles.to_parquet(tiles_path)
+    
+    logger.info("Classification pipeline completed successfully")
 
 
 if __name__ == "__main__":
