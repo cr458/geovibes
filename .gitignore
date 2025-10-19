@@ -84,6 +84,7 @@ target/
 
 # Jupyter Notebook
 *.ipynb_checkpoints
+notebooks/*.ipynb
 
 # IPython
 profile_default/
@@ -181,3 +182,8 @@ cython_debug/
 
 # PyPI configuration file
 .pypirc
+
+databases/
+faiss_db
+*.geojson
+*.csv
