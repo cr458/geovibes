@@ -10,9 +10,6 @@ __pycache__/
 # C extensions
 *.so
 
-# UV
-uv.lock
-
 # Distribution / packaging
 .Python
 build/
@@ -185,3 +182,4 @@ cython_debug/
 notebooks/*.ipynb
 labeled_dataset_*.geojson
 labeled_dataset_*_labels.csv
+
