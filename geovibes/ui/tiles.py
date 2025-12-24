@@ -257,6 +257,13 @@ class TilePanel:
         self.dissimilar_btn.add_class("sort-btn-inactive")
         self.dissimilar_btn.on_click(self._on_dissimilar_click)
 
+        self.geo_filter_btn = Button(
+            description="📍 Filter Area",
+            layout=Layout(width="100%", height="28px"),
+        )
+        self.geo_filter_btn.add_class("sort-btn-inactive")
+        self.geo_filter_btn.on_click(self._on_geo_filter_click)
+
         self.load_more_btn = Button(
             description="Load More",
             layout=Layout(
@@ -290,6 +297,15 @@ class TilePanel:
             ),
         )
 
+        # Geographic filter row: full width filter toggle
+        geo_filter_row = HBox(
+            [self.geo_filter_btn],
+            layout=Layout(
+                padding="0 8px 8px 8px",
+                width="100%",
+            ),
+        )
+
         # Load More button row: full width prominent button
         load_more_row = HBox(
             [self.load_more_btn],
@@ -300,7 +316,7 @@ class TilePanel:
         )
 
         header = VBox(
-            [header_row, sort_row, load_more_row],
+            [header_row, sort_row, geo_filter_row, load_more_row],
             layout=Layout(width="100%"),
         )
         header.add_class("tile-header")
@@ -404,6 +420,12 @@ class TilePanel:
         self._tiles_ready_callback = None
         self._page_sizes = []
         self._loader_token = None
+        if self.state.geo_filter_mode:
+            self.state.geo_filter_mode = False
+            self.state.geo_filter_polygon = None
+            self.geo_filter_btn.remove_class("sort-btn-active")
+            self.geo_filter_btn.add_class("sort-btn-inactive")
+            self.geo_filter_btn.description = "📍 Filter Area"
 
     def update_results(
         self,
@@ -443,6 +465,22 @@ class TilePanel:
             loader_token=self._loader_token,
         )
 
+    def apply_geographic_filter(self) -> None:
+        if self.state.last_search_results_df is None:
+            return
+        for future in list(self._pending_futures):
+            future.cancel()
+        self._pending_futures.clear()
+        self._pending_batches.clear()
+        self.state.tile_page = 0
+        self._page_sizes = []
+        self.results_grid.children = []
+        self._render_current_page(
+            append=False,
+            on_finish=self._handle_tiles_ready,
+            loader_token=self._loader_token,
+        )
+
     # ------------------------------------------------------------------
     # Internal helpers
     # ------------------------------------------------------------------
@@ -473,6 +511,24 @@ class TilePanel:
         self.similar_btn.remove_class("sort-btn-active")
         self.similar_btn.add_class("sort-btn-inactive")
         self._trigger_sort_refresh()
+
+    def _on_geo_filter_click(self, _button) -> None:
+        self.state.geo_filter_mode = not self.state.geo_filter_mode
+        if self.state.geo_filter_mode:
+            self.state.execute_label_point = False
+            self.state.lasso_mode = False
+            self.geo_filter_btn.remove_class("sort-btn-inactive")
+            self.geo_filter_btn.add_class("sort-btn-active")
+            self.geo_filter_btn.description = "📍 Filter Active"
+            self._update_operation("📍 Draw polygon to filter tiles by area")
+        else:
+            self.state.execute_label_point = True
+            self.geo_filter_btn.remove_class("sort-btn-active")
+            self.geo_filter_btn.add_class("sort-btn-inactive")
+            self.geo_filter_btn.description = "📍 Filter Area"
+            self.state.geo_filter_polygon = None
+            self._trigger_sort_refresh()
+            self._update_operation(None)
 
     def _trigger_sort_refresh(self) -> None:
         if self.state.last_search_results_df is None:
@@ -525,6 +581,25 @@ class TilePanel:
             if on_finish:
                 on_finish()
             return
+
+        # Apply geographic filter if active
+        if (
+            self.state.geo_filter_mode
+            and self.state.geo_filter_polygon is not None
+            and "geometry_wkt" in df.columns
+        ):
+            filter_polygon = self.state.geo_filter_polygon
+            mask = df["geometry_wkt"].apply(
+                lambda wkt: shapely.wkt.loads(wkt).within(filter_polygon)
+            )
+            df = df[mask].reset_index(drop=True)
+            if df.empty:
+                self.results_grid.children = []
+                self.next_tiles_btn.layout.display = "none"
+                self._update_operation("⚠️ No tiles within filter area")
+                if on_finish:
+                    on_finish()
+                return
 
         # Determine if we should reverse the order
         # - Search mode: data is sorted by distance ascending (low = similar)

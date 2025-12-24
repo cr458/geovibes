@@ -37,6 +37,8 @@ class AppState:
     detection_mode: bool = False
     detection_data: Optional[Dict[str, Any]] = None
     detection_labels: Dict[str, int] = field(default_factory=dict)
+    geo_filter_mode: bool = False
+    geo_filter_polygon: Optional[Any] = None
 
     def set_label_mode(self, label: str) -> None:
         """Update the active label mode."""
@@ -65,6 +67,8 @@ class AppState:
         self.detection_mode = False
         self.detection_data = None
         self.detection_labels.clear()
+        self.geo_filter_mode = False
+        self.geo_filter_polygon = None
 
     def toggle_label(self, point_id: str, label: str) -> None:
         """Toggle the label for a point_id, ensuring exclusivity."""

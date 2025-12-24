@@ -841,6 +841,9 @@ class GeoVibes:
             log_to_file("Handled as Ctrl-Click for Google Maps. Returning.")
             return
 
+        if self.state.geo_filter_mode:
+            return
+
         if self.state.detection_mode:
             self._handle_detection_click(lon, lat)
             return
@@ -957,6 +960,14 @@ class GeoVibes:
         if action == "created" and geo_json["geometry"]["type"] == "Polygon":
             polygon_coords = geo_json["geometry"]["coordinates"][0]
             polygon = shapely.geometry.Polygon(polygon_coords)
+
+            # Geographic filter mode: store polygon and filter tiles
+            if self.state.geo_filter_mode:
+                self.state.geo_filter_polygon = polygon
+                self.map_manager.draw_control.clear()
+                self.tile_panel.apply_geographic_filter()
+                self._show_operation_status("✅ Geographic filter applied")
+                return
 
             # Detection mode: label detections within polygon
             if self.state.detection_mode and self.state.detection_data:

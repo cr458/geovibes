@@ -169,12 +169,17 @@ class MapManager:
         if lat is None or lon is None:
             center = self.map.center
             lat, lon = center[0], center[1]
-        mode = "Polygon" if self.state.lasso_mode else "Point"
+        if self.state.geo_filter_mode:
+            mode = "Filter"
+        elif self.state.lasso_mode:
+            mode = "Polygon"
+        else:
+            mode = "Point"
         self.status_bar.value = self.status_bus.render(
             lat=lat,
             lon=lon,
             mode=mode,
-            label=self.state.current_label,
+            label=self.state.current_label if not self.state.geo_filter_mode else "N/A",
             polygon_drawing=self.state.polygon_drawing,
         )
 
