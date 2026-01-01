@@ -27,6 +27,20 @@ from .utils import (
 class DataManager:
     """Encapsulates configuration, database, and FAISS operations."""
 
+    @staticmethod
+    def is_remote_url(path: str) -> bool:
+        """Check if a path is a remote URL (S3 or GCS).
+
+        Args:
+            path: File path or URL to check.
+
+        Returns:
+            True if the path is a remote URL (s3:// or gs://), False otherwise.
+        """
+        if not path:
+            return False
+        return path.startswith("s3://") or path.startswith("gs://")
+
     def __init__(
         self,
         *,
