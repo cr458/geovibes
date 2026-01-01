@@ -67,11 +67,28 @@ class RemoteDuckDB:
             # Verify connection by getting table count
             self._conn.execute("SELECT 1").fetchone()
 
+            # Warm up by loading table metadata (makes subsequent queries fast)
+            self._warmup()
+
         except duckdb.IOException as e:
             self._handle_io_error(e, url)
         except Exception:
             self._conn = None
             raise
+
+    def _warmup(self) -> None:
+        """Warm up connection by loading table metadata.
+
+        This ensures subsequent queries are fast (~1ms instead of ~2s).
+        """
+        try:
+            # Touch the geo_embeddings table including geometry to load metadata
+            self._conn.execute(
+                "SELECT id, geometry FROM geo_embeddings LIMIT 1"
+            ).fetchone()
+            logger.debug("Connection warmed up")
+        except Exception as e:
+            logger.warning(f"Warmup query failed (non-fatal): {e}")
 
     def _handle_io_error(self, error: Exception, url: str):
         """Convert DuckDB IO errors to clear Python exceptions."""
