@@ -220,6 +220,7 @@ def publish_database(
     work_dir: Path,
     skip_existing: bool = True,
     dry_run: bool = False,
+    optimize: bool = False,
 ) -> None:
     """Publish a database to Source Cooperative."""
     model_name = parse_model_name(db_path)
@@ -232,6 +233,7 @@ def publish_database(
     logger.info(f"Region: {region}")
     logger.info(f"Date range: {date_range}")
     logger.info(f"S3 destination: s3://{S3_BUCKET}/{s3_prefix}/")
+    logger.info(f"Optimize: {optimize}")
     logger.info(f"{'=' * 60}\n")
 
     if dry_run:
@@ -258,25 +260,32 @@ def publish_database(
     # Create work directory
     work_dir.mkdir(parents=True, exist_ok=True)
 
-    # Step 1: Optimize database
-    optimized_db = work_dir / "metadata.db"
-    optimize_database(db_path, optimized_db)
+    # Step 1: Optimize database (if requested) or use original
+    if optimize:
+        final_db = work_dir / "metadata.db"
+        optimize_database(db_path, final_db)
+        cleanup_db = True
+    else:
+        final_db = db_path
+        cleanup_db = False
+        logger.info("Skipping optimization (database already optimized by faiss_db.py)")
 
     # Step 2: Generate geometry cache
     geometry_cache = work_dir / "geometry_cache.parquet"
-    generate_geometry_cache(optimized_db, geometry_cache)
+    generate_geometry_cache(final_db, geometry_cache)
 
     # Step 3: Upload all files
     logger.info("\nUploading to Source Cooperative...")
 
-    upload_with_progress(s3, optimized_db, S3_BUCKET, f"{s3_prefix}/metadata.db")
+    upload_with_progress(s3, final_db, S3_BUCKET, f"{s3_prefix}/metadata.db")
     upload_with_progress(s3, faiss_path, S3_BUCKET, f"{s3_prefix}/faiss.index")
     upload_with_progress(
         s3, geometry_cache, S3_BUCKET, f"{s3_prefix}/geometry_cache.parquet"
     )
 
     # Cleanup
-    optimized_db.unlink()
+    if cleanup_db:
+        final_db.unlink()
     geometry_cache.unlink()
 
     logger.info(f"\n✓ Successfully published {model_name}")
@@ -322,6 +331,11 @@ def main():
         action="store_true",
         help="Show what would be uploaded without actually uploading",
     )
+    parser.add_argument(
+        "--optimize",
+        action="store_true",
+        help="Re-optimize database (sort by ID, create indexes). Not needed for databases created by faiss_db.py after 2026-01-18.",
+    )
     args = parser.parse_args()
 
     if not args.db_path.exists():
@@ -366,6 +380,7 @@ def main():
         work_dir=args.work_dir,
         skip_existing=not args.force,
         dry_run=args.dry_run,
+        optimize=args.optimize,
     )
 
     return 0
