@@ -863,15 +863,33 @@ class GeoVibes:
     # ------------------------------------------------------------------
 
     def label_point(self, lon: float, lat: float) -> None:
-        log_to_file("label_point: Querying database for nearest point.")
+        import time
+
+        total_start = time.perf_counter()
+        log_to_file("=" * 60)
+        log_to_file(f"label_point: START (lon={lon:.4f}, lat={lat:.4f})")
+
+        # Step 1: Query nearest point
+        step_start = time.perf_counter()
+        log_to_file("label_point: [1/4] Querying database for nearest point...")
         result = self.data.nearest_point(lon, lat)
+        step_time = (time.perf_counter() - step_start) * 1000
+        log_to_file(f"label_point: [1/4] nearest_point completed in {step_time:.1f}ms")
+
         if result is None:
             self._show_operation_status("⚠️ No points found near click.")
+            log_to_file("label_point: No points found, returning early")
             return
 
+        # Step 2: Extract and cache embedding
+        step_start = time.perf_counter()
         point_id = str(result[0])
         embedding = np.array(result[3])
         self.state.cached_embeddings[point_id] = embedding
+        step_time = (time.perf_counter() - step_start) * 1000
+        log_to_file(
+            f"label_point: [2/4] Extract embedding completed in {step_time:.1f}ms (id={point_id})"
+        )
 
         if self.state.select_val == UIConstants.ERASE_LABEL:
             erase_query = """
@@ -908,8 +926,25 @@ class GeoVibes:
             else:
                 self._show_operation_status(f"✅ Labeled point as {status}")
 
+        # Step 3: Update map layers
+        step_start = time.perf_counter()
+        log_to_file("label_point: [3/4] Updating map layers...")
         self._update_layers()
+        step_time = (time.perf_counter() - step_start) * 1000
+        log_to_file(f"label_point: [3/4] _update_layers completed in {step_time:.1f}ms")
+
+        # Step 4: Update query vector
+        step_start = time.perf_counter()
+        log_to_file("label_point: [4/4] Updating query vector...")
         self._update_query_vector()
+        step_time = (time.perf_counter() - step_start) * 1000
+        log_to_file(
+            f"label_point: [4/4] _update_query_vector completed in {step_time:.1f}ms"
+        )
+
+        total_time = (time.perf_counter() - total_start) * 1000
+        log_to_file(f"label_point: DONE total={total_time:.1f}ms")
+        log_to_file("=" * 60)
 
     def _handle_detection_click(self, lon: float, lat: float) -> None:
         if not self.state.detection_data:

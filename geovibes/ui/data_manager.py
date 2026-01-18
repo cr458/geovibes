@@ -777,9 +777,25 @@ class DataManager:
             yield chunk_df
 
     def nearest_point(self, lon: float, lat: float):
+        import time
+
+        log_to_file(f"nearest_point: START (lon={lon:.4f}, lat={lat:.4f})")
         sql = DatabaseConstants.NEAREST_POINT_QUERY
         params = [lon, lat]
-        return self.duckdb_connection.execute(sql, params).fetchone()
+
+        exec_start = time.perf_counter()
+        cursor = self.duckdb_connection.execute(sql, params)
+        exec_time = (time.perf_counter() - exec_start) * 1000
+        log_to_file(f"nearest_point: execute() completed in {exec_time:.1f}ms")
+
+        fetch_start = time.perf_counter()
+        result = cursor.fetchone()
+        fetch_time = (time.perf_counter() - fetch_start) * 1000
+        log_to_file(f"nearest_point: fetchone() completed in {fetch_time:.1f}ms")
+
+        total_time = exec_time + fetch_time
+        log_to_file(f"nearest_point: DONE total={total_time:.1f}ms")
+        return result
 
     def query_geometries(self, ids: List[str]):
         if not ids:
