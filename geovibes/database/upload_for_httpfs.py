@@ -14,7 +14,7 @@ Usage:
         local_databases/alabama_google_satellite_embeddings_v1_2024_2025_25_0_10_metadata.db \
         --profile my-profile
 
-Note: Static credentials (SCRPTLC1EMW2CQLBT59M15YC) have read-only access.
+Note: Static credentials (***REMOVED***) have read-only access.
       Session tokens from Source Cooperative console are required for writes.
 """
 

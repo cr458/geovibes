@@ -435,6 +435,38 @@ def create_faiss_index(
         logging.info("FAISS index successfully built and saved.")
 
 
+def export_geometry_cache(db_path: str, output_path: str) -> None:
+    """Export id + geometry to compressed Parquet for local caching.
+
+    This creates a lightweight file (~50-100MB) containing only the id and
+    geometry columns, which can be downloaded and cached locally for fast
+    search metadata queries over httpfs.
+
+    Args:
+        db_path: Path to the DuckDB database
+        output_path: Path for the output Parquet file
+    """
+    logging.info(f"Exporting geometry cache to {output_path}")
+    start_time = time.time()
+
+    con = duckdb.connect(db_path, read_only=True)
+    con.execute("INSTALL spatial; LOAD spatial;")
+
+    row_count = con.execute("SELECT COUNT(*) FROM geo_embeddings").fetchone()[0]
+    logging.info(f"Exporting {row_count:,} geometries...")
+
+    con.execute(f"""
+        COPY (SELECT id, geometry FROM geo_embeddings ORDER BY id)
+        TO '{output_path}' (FORMAT PARQUET, COMPRESSION ZSTD)
+    """)
+
+    con.close()
+
+    file_size_mb = pathlib.Path(output_path).stat().st_size / (1024 * 1024)
+    elapsed = time.time() - start_time
+    logging.info(f"Geometry cache exported: {file_size_mb:.1f} MB in {elapsed:.1f}s")
+
+
 def _prefix_name_with_roi(name: str, roi_file: Optional[str]) -> str:
     if not roi_file:
         return name
@@ -598,9 +630,11 @@ def main():
     faiss_params_str = f"faiss_{args.nlist}_{args.m}_{args.nbits}"
     db_filename = f"{args.name}_metadata.db"
     index_filename = f"{args.name}_{faiss_params_str}.index"
+    geometry_cache_filename = f"{args.name}_geometry.parquet"
 
     db_path = str((local_output_dir / db_filename).resolve())
     index_path = str((local_output_dir / index_filename).resolve())
+    geometry_cache_path = str((local_output_dir / geometry_cache_filename).resolve())
 
     # Validate mutual exclusivity and ROI-based arguments
     if getattr(args, "roi_file", None) and args.parquet_files:
@@ -777,11 +811,14 @@ def main():
         args.batch_size,
     )
 
+    # --- Phase 3: Export geometry cache for httpfs optimization ---
+    export_geometry_cache(db_path, geometry_cache_path)
+
     logging.info(
         f"Total process completed in {time.time() - start_total_time:.2f} seconds."
     )
     logging.info(
-        f"Artifacts created:\n- DuckDB: {db_path}\n- FAISS Index: {index_path}"
+        f"Artifacts created:\n- DuckDB: {db_path}\n- FAISS Index: {index_path}\n- Geometry Cache: {geometry_cache_path}"
     )
 
     if temp_dir and temp_dir_created:
@@ -800,7 +837,7 @@ def main():
                 tar_local_dir = str(local_output_dir)
             tar_local_path = os.path.join(tar_local_dir, tar_name)
 
-            cmd = f"tar -c {shlex.quote(db_path)} {shlex.quote(index_path)} | pigz > {shlex.quote(tar_local_path)}"
+            cmd = f"tar -c {shlex.quote(db_path)} {shlex.quote(index_path)} {shlex.quote(geometry_cache_path)} | pigz > {shlex.quote(tar_local_path)}"
             try:
                 subprocess.run(["bash", "-lc", cmd], check=True)
                 logging.info(f"Created tarball with pigz: {tar_local_path}")
@@ -808,7 +845,7 @@ def main():
                 logging.warning(
                     f"pigz tarball creation failed ({e}); falling back to gzip."
                 )
-                fallback_cmd = f"tar -czf {shlex.quote(tar_local_path)} {shlex.quote(db_path)} {shlex.quote(index_path)}"
+                fallback_cmd = f"tar -czf {shlex.quote(tar_local_path)} {shlex.quote(db_path)} {shlex.quote(index_path)} {shlex.quote(geometry_cache_path)}"
                 subprocess.run(["bash", "-lc", fallback_cmd], check=True)
                 logging.info(f"Created tarball with gzip fallback: {tar_local_path}")
 

@@ -257,8 +257,8 @@ def test_httpfs_connection():
     conn.execute("INSTALL aws; LOAD aws;")
 
     # Source Cooperative config
-    conn.execute("SET s3_access_key_id='SCRPTLC1EMW2CQLBT59M15YC';")
-    conn.execute("SET s3_secret_access_key='RfCYYNR6ZRfjW2thyntnaG6pNFC9Vil1PS943rx2ElSzOdBRCcuAGW5gq9hau72H';")
+    conn.execute("SET s3_access_key_id='***REMOVED***';")
+    conn.execute("SET s3_secret_access_key='***REMOVED***';")
     conn.execute("SET s3_endpoint='data.source.coop';")
     conn.execute("SET s3_url_style='path';")
     conn.execute("SET s3_region='us-west-2';")
@@ -1131,3 +1131,228 @@ The FAISS index is automatically downloaded and cached at `~/.cache/geovibes/fai
 | ~500ms per row group over httpfs | Fundamental network latency |
 | FAISS scatter unavoidable | Results span many row groups by design |
 | Caching helps repeat queries | Same row groups instant after first load |
+
+---
+
+## Phase 3: Local Geometry Cache (2025-01)
+
+### Problem: Search Metadata Query Bottleneck
+
+After optimizing database sorting (Phase 2), profiling revealed the remaining bottleneck:
+
+```
+_search_faiss: [1/3] FAISS search completed in 1797.4ms (1001 results)
+_search_faiss: [2/3] Metadata query completed in 25998.3ms  ← 26 seconds!
+_search_faiss: [3/3] Process results completed in 100.6ms
+_search_faiss: DONE total=27901.7ms
+```
+
+The metadata query fetches geometries for 1001 FAISS result IDs:
+
+```sql
+SELECT id, ST_AsGeoJSON(geometry), ST_AsText(geometry)
+FROM geo_embeddings
+WHERE id IN (?, ?, ?, ... 1001 IDs ...)
+```
+
+**Why it's slow**: FAISS returns IDs by embedding similarity, not storage order. Results are scattered across ~40 row groups, each requiring ~500ms HTTP fetch from S3.
+
+### Options Considered
+
+| Option | Approach | Startup Cost | Search Latency | Memory |
+|--------|----------|--------------|----------------|--------|
+| **Warmup all row groups** | Preload entire DB into cache | +20-30s every session | Fast (if cached) | High (~2GB) |
+| **Local geometry cache** | Download small geometry-only file | +30s once | Always fast | Low |
+
+### Decision: Local Geometry Cache
+
+**Rationale:**
+1. **Predictable performance** - Always fast, no cache eviction risk
+2. **Small file size** - ~50-100MB (just id + Point geometry) vs 2.2GB full DB
+3. **One-time download** - Like FAISS index, cached locally
+4. **Memory efficient** - DuckDB memory-maps local files
+5. **Offline capable** - Works without network after initial download
+
+The alternative (warmup all row groups) would add 20-30 seconds to every kernel startup and still risk cache eviction under memory pressure.
+
+### Implementation
+
+#### File Format
+
+Parquet with ZSTD compression:
+- `id`: BIGINT (8 bytes)
+- `geometry`: GEOMETRY (Point, ~24 bytes WKB)
+
+**Naming convention:**
+```
+Database:        alabama_quantized_dino_..._metadata_sorted.db
+Geometry cache:  alabama_quantized_dino_..._geometry.parquet
+```
+
+#### Size Estimates
+
+| Database | Rows | Full DB | Geometry Cache |
+|----------|------|---------|----------------|
+| Quantized DINO | 5.3M | 2.2 GB | ~50-100 MB |
+| Google Satellite | 2.2M | 1.2 GB | ~20-40 MB |
+
+#### Generation (`faiss_db.py`)
+
+```python
+def export_geometry_cache(con, output_path: str):
+    """Export id + geometry to compressed Parquet for local caching."""
+    con.execute(f"""
+        COPY (SELECT id, geometry FROM geo_embeddings ORDER BY id)
+        TO '{output_path}' (FORMAT PARQUET, COMPRESSION ZSTD)
+    """)
+```
+
+#### Generating Geometry Cache
+
+**For new databases** — generated automatically by `faiss_db.py`:
+```bash
+python geovibes/database/faiss_db.py --roi-file ... --output_dir ...
+# Creates: *_metadata.db, *_faiss.index, *_geometry_cache.parquet
+```
+
+**For existing databases**:
+```python
+from geovibes.database.faiss_db import export_geometry_cache
+export_geometry_cache("/path/to/database.db", "/path/to/geometry_cache.parquet")
+```
+
+**Upload to S3**:
+```bash
+aws s3 cp /path/to/geometry_cache.parquet \
+    s3://us-west-2.opendata.source.coop/geovibes/search/.../name_geometry_cache.parquet
+```
+
+#### Usage (`data_manager.py`)
+
+```python
+def _load_geometry_cache(self):
+    """Download and connect to local geometry cache."""
+    cache_url = self._infer_geometry_cache_url()
+    local_path = self.cache.get_geometry_cache(cache_url)
+
+    self.geometry_cache_conn = duckdb.connect(":memory:")
+    self.geometry_cache_conn.execute(f"""
+        CREATE VIEW geo_cache AS SELECT * FROM read_parquet('{local_path}')
+    """)
+
+def query_search_metadata(self, faiss_ids: List[int]):
+    # Use local cache if available
+    conn = self.geometry_cache_conn or self.duckdb_connection
+    # ... query logic
+```
+
+#### Cache Location
+
+```
+~/.cache/geovibes/
+├── faiss/           # FAISS indexes
+│   └── abc123.index
+└── geometry/        # Geometry caches
+    └── def456.parquet
+```
+
+### Expected Performance
+
+| Operation | Before (httpfs) | After (local cache) |
+|-----------|-----------------|---------------------|
+| First search | 26 seconds | <1 second |
+| Subsequent searches | <1 second | <1 second |
+| Startup (first time) | - | +30 seconds (download) |
+| Startup (cached) | - | <1 second |
+
+### S3 Files
+
+After implementation, each database will have three files:
+
+```
+s3://us-west-2.opendata.source.coop/geovibes/search/USA/alabama/.../
+├── alabama_..._metadata_sorted.db      # Full database (embeddings + geometry)
+├── alabama_..._faiss_4096_64_8.index   # FAISS index
+└── alabama_..._geometry_cache.parquet  # Geometry cache (NEW)
+```
+
+### Generating Remaining Geometry Caches
+
+**Status:**
+- [x] `alabama_quantized_dino_vit_small_patch16_224_2024_2025_32_16_10_geometry_cache.parquet` - Uploaded
+- [ ] `alabama_google_satellite_embeddings_v1_2024_2025_25_0_10_geometry_cache.parquet` - TODO
+
+**Step 1: Clone repo and install dependencies**
+```bash
+git clone git@github.com:cr458/geovibes.git
+cd geovibes
+uv venv && source .venv/bin/activate
+uv pip install -e .
+```
+
+**Step 2: Download the sorted database from S3**
+```bash
+# Set Source Cooperative read credentials
+export SOURCE_COOP_KEY_ID="<get from source.coop/geovibes>"
+export SOURCE_COOP_SECRET_KEY="<get from source.coop/geovibes>"
+
+# Download Google Satellite database
+aws s3 cp \
+  s3://us-west-2.opendata.source.coop/geovibes/search/USA/alabama/2024-01-01-2025-01-01/alabama_google_satellite_embeddings_v1_2024_2025_25_0_10_metadata_sorted.db \
+  /tmp/alabama_google_satellite_embeddings_v1_2024_2025_25_0_10_metadata_sorted.db
+```
+
+**Step 3: Generate the geometry cache**
+```python
+# generate_geometry_cache.py
+import duckdb
+
+db_path = "/tmp/alabama_google_satellite_embeddings_v1_2024_2025_25_0_10_metadata_sorted.db"
+output_path = "/tmp/alabama_google_satellite_embeddings_v1_2024_2025_25_0_10_geometry_cache.parquet"
+
+con = duckdb.connect(db_path, read_only=True)
+con.execute("INSTALL spatial; LOAD spatial;")
+
+print(f"Exporting geometry cache from {db_path}...")
+con.execute(f"""
+    COPY (SELECT id, geometry FROM geo_embeddings ORDER BY id)
+    TO '{output_path}' (FORMAT PARQUET, COMPRESSION ZSTD)
+""")
+print(f"Created {output_path}")
+con.close()
+```
+
+Run with:
+```bash
+uv run python generate_geometry_cache.py
+```
+
+**Step 4: Upload to S3**
+
+Get write credentials from Source Cooperative console, then:
+```bash
+# Set session credentials from Source Cooperative console
+export AWS_ACCESS_KEY_ID="ASIA..."
+export AWS_SECRET_ACCESS_KEY="..."
+export AWS_SESSION_TOKEN="..."
+export AWS_DEFAULT_REGION="us-west-2"
+
+# Upload (use direct AWS endpoint for writes)
+aws s3 cp \
+  /tmp/alabama_google_satellite_embeddings_v1_2024_2025_25_0_10_geometry_cache.parquet \
+  s3://us-west-2.opendata.source.coop/geovibes/search/USA/alabama/2024-01-01-2025-01-01/alabama_google_satellite_embeddings_v1_2024_2025_25_0_10_geometry_cache.parquet
+
+# Verify upload
+aws s3 ls s3://us-west-2.opendata.source.coop/geovibes/search/USA/alabama/2024-01-01-2025-01-01/ | grep geometry_cache
+```
+
+**Step 5: Verify the file works**
+```python
+import duckdb
+con = duckdb.connect()
+con.execute("INSTALL spatial; LOAD spatial;")
+df = con.execute("""
+    SELECT COUNT(*) as cnt FROM read_parquet('/tmp/alabama_google_satellite_embeddings_v1_2024_2025_25_0_10_geometry_cache.parquet')
+""").fetchdf()
+print(f"Row count: {df['cnt'][0]}")  # Should be ~2.18M for Google Satellite
+```

@@ -145,6 +145,7 @@ class GeoVibes:
         cls,
         duckdb_path: Optional[str] = None,
         faiss_path: Optional[str] = None,
+        geometry_cache_path: Optional[str] = None,
         duckdb_directory: Optional[str] = None,
         boundary_path: Optional[str] = None,
         start_date: str = "2024-01-01",
@@ -156,6 +157,7 @@ class GeoVibes:
         return cls(
             duckdb_path=duckdb_path,
             faiss_path=faiss_path,
+            geometry_cache_path=geometry_cache_path,
             duckdb_directory=duckdb_directory,
             boundary_path=boundary_path,
             start_date=start_date,
@@ -169,6 +171,7 @@ class GeoVibes:
         self,
         duckdb_path: Optional[str] = None,
         faiss_path: Optional[str] = None,
+        geometry_cache_path: Optional[str] = None,
         duckdb_directory: Optional[str] = None,
         boundary_path: Optional[str] = None,
         start_date: Optional[str] = None,
@@ -195,6 +198,7 @@ class GeoVibes:
         self.data = DataManager(
             duckdb_path=duckdb_path,
             faiss_path=faiss_path,
+            geometry_cache_path=geometry_cache_path,
             duckdb_directory=duckdb_directory,
             boundary_path=boundary_path,
             start_date=start_date,
@@ -863,15 +867,33 @@ class GeoVibes:
     # ------------------------------------------------------------------
 
     def label_point(self, lon: float, lat: float) -> None:
-        log_to_file("label_point: Querying database for nearest point.")
+        import time
+
+        total_start = time.perf_counter()
+        log_to_file("=" * 60)
+        log_to_file(f"label_point: START (lon={lon:.4f}, lat={lat:.4f})")
+
+        # Step 1: Query nearest point
+        step_start = time.perf_counter()
+        log_to_file("label_point: [1/4] Querying database for nearest point...")
         result = self.data.nearest_point(lon, lat)
+        step_time = (time.perf_counter() - step_start) * 1000
+        log_to_file(f"label_point: [1/4] nearest_point completed in {step_time:.1f}ms")
+
         if result is None:
             self._show_operation_status("⚠️ No points found near click.")
+            log_to_file("label_point: No points found, returning early")
             return
 
+        # Step 2: Extract and cache embedding
+        step_start = time.perf_counter()
         point_id = str(result[0])
         embedding = np.array(result[3])
         self.state.cached_embeddings[point_id] = embedding
+        step_time = (time.perf_counter() - step_start) * 1000
+        log_to_file(
+            f"label_point: [2/4] Extract embedding completed in {step_time:.1f}ms (id={point_id})"
+        )
 
         if self.state.select_val == UIConstants.ERASE_LABEL:
             erase_query = """
@@ -908,8 +930,25 @@ class GeoVibes:
             else:
                 self._show_operation_status(f"✅ Labeled point as {status}")
 
+        # Step 3: Update map layers
+        step_start = time.perf_counter()
+        log_to_file("label_point: [3/4] Updating map layers...")
         self._update_layers()
+        step_time = (time.perf_counter() - step_start) * 1000
+        log_to_file(f"label_point: [3/4] _update_layers completed in {step_time:.1f}ms")
+
+        # Step 4: Update query vector
+        step_start = time.perf_counter()
+        log_to_file("label_point: [4/4] Updating query vector...")
         self._update_query_vector()
+        step_time = (time.perf_counter() - step_start) * 1000
+        log_to_file(
+            f"label_point: [4/4] _update_query_vector completed in {step_time:.1f}ms"
+        )
+
+        total_time = (time.perf_counter() - total_start) * 1000
+        log_to_file(f"label_point: DONE total={total_time:.1f}ms")
+        log_to_file("=" * 60)
 
     def _handle_detection_click(self, lon: float, lat: float) -> None:
         if not self.state.detection_data:
@@ -1073,11 +1112,23 @@ class GeoVibes:
         self._search_faiss()
 
     def _search_faiss(self) -> None:
+        import time
+
+        total_start = time.perf_counter()
+        log_to_file("=" * 60)
+        log_to_file("_search_faiss: START")
+
         n_neighbors = self.neighbors_slider.v_model
         all_labeled = self.state.pos_ids + self.state.neg_ids
         extra_results = min(len(all_labeled), n_neighbors // 2)
         total_requested = n_neighbors + extra_results
+        log_to_file(
+            f"_search_faiss: Requesting {total_requested} results (n_neighbors={n_neighbors})"
+        )
 
+        # Step 1: FAISS search
+        step_start = time.perf_counter()
+        log_to_file("_search_faiss: [1/3] Running FAISS search...")
         query_vector_np = self.state.query_vector.reshape(1, -1).astype("float32")
         params = faiss.SearchParametersIVF(nprobe=4096)
         self._show_operation_status(
@@ -1088,6 +1139,10 @@ class GeoVibes:
         )
         faiss_ids = ids[0].tolist()
         faiss_distances = distances[0].tolist()
+        step_time = (time.perf_counter() - step_start) * 1000
+        log_to_file(
+            f"_search_faiss: [1/3] FAISS search completed in {step_time:.1f}ms ({len(faiss_ids)} results)"
+        )
 
         if not faiss_ids:
             self._show_operation_status("✅ Search complete. No results found.")
@@ -1095,7 +1150,17 @@ class GeoVibes:
             self.tile_panel.clear()
             return
 
+        # Step 2: Query metadata from DuckDB
+        step_start = time.perf_counter()
+        log_to_file(
+            f"_search_faiss: [2/3] Querying metadata for {len(faiss_ids)} IDs..."
+        )
         metadata_df = self.data.query_search_metadata(faiss_ids)
+        step_time = (time.perf_counter() - step_start) * 1000
+        log_to_file(
+            f"_search_faiss: [2/3] Metadata query completed in {step_time:.1f}ms"
+        )
+
         if metadata_df is None or metadata_df.empty:
             self._show_operation_status("✅ Search complete. No results found.")
             self.map_manager.update_search_layer(self._empty_collection())
@@ -1107,7 +1172,18 @@ class GeoVibes:
         metadata_df = metadata_df.sort_values("sort_order").drop(columns=["sort_order"])
         metadata_df["distance"] = faiss_distances[: len(metadata_df)]
 
+        # Step 3: Process and display results
+        step_start = time.perf_counter()
+        log_to_file("_search_faiss: [3/3] Processing results...")
         self._process_search_results(metadata_df, n_neighbors)
+        step_time = (time.perf_counter() - step_start) * 1000
+        log_to_file(
+            f"_search_faiss: [3/3] Process results completed in {step_time:.1f}ms"
+        )
+
+        total_time = (time.perf_counter() - total_start) * 1000
+        log_to_file(f"_search_faiss: DONE total={total_time:.1f}ms")
+        log_to_file("=" * 60)
 
     def _process_search_results(
         self, results_df: pd.DataFrame, n_neighbors: int

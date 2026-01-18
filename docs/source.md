@@ -32,17 +32,31 @@ s3://us-west-2.opendata.source.coop/
 
 ## Read Access (Public)
 
-Static credentials for read-only access:
+Source Cooperative provides static read-only credentials for public data access.
+
+### Getting Public Credentials
+
+1. Visit [source.coop/geovibes](https://source.coop/repositories/geovibes/geovibes)
+2. Find the public read-only credentials in the repository documentation
+3. Set environment variables:
+
+```bash
+export SOURCE_COOP_KEY_ID="<public_key_id>"
+export SOURCE_COOP_SECRET_KEY="<public_secret_key>"
+```
+
+### boto3 Configuration
 
 ```python
+import os
 import boto3
 from botocore.config import Config
 
 s3 = boto3.client(
     's3',
     endpoint_url='https://data.source.coop',
-    aws_access_key_id='SCRPTLC1EMW2CQLBT59M15YC',
-    aws_secret_access_key='RfCYYNR6ZRfjW2thyntnaG6pNFC9Vil1PS943rx2ElSzOdBRCcuAGW5gq9hau72H',
+    aws_access_key_id=os.environ['SOURCE_COOP_KEY_ID'],
+    aws_secret_access_key=os.environ['SOURCE_COOP_SECRET_KEY'],
     region_name='us-west-2',
     config=Config(signature_version='s3v4')
 )
@@ -51,15 +65,16 @@ s3 = boto3.client(
 ### DuckDB Configuration
 
 ```python
+import os
 import duckdb
 
 conn = duckdb.connect()
 conn.execute("INSTALL httpfs; LOAD httpfs;")
 conn.execute("INSTALL aws; LOAD aws;")
 
-# Source Cooperative config
-conn.execute("SET s3_access_key_id='SCRPTLC1EMW2CQLBT59M15YC';")
-conn.execute("SET s3_secret_access_key='RfCYYNR6ZRfjW2thyntnaG6pNFC9Vil1PS943rx2ElSzOdBRCcuAGW5gq9hau72H';")
+# Source Cooperative config (use environment variables)
+conn.execute(f"SET s3_access_key_id='{os.environ['SOURCE_COOP_KEY_ID']}';")
+conn.execute(f"SET s3_secret_access_key='{os.environ['SOURCE_COOP_SECRET_KEY']}';")
 conn.execute("SET s3_endpoint='data.source.coop';")
 conn.execute("SET s3_url_style='path';")
 conn.execute("SET s3_region='us-west-2';")
