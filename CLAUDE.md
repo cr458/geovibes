@@ -126,6 +126,40 @@ When deploying subagents for bug analysis:
 - **Clean Artifacts**: Do not commit generated files, output folders, benchmark scripts, or test data files. Add them to .gitignore instead.
 - **PR Summaries**: When asked, generate summary PR messages suitable for GitHub.
 
+### Credentials and Secrets (CRITICAL)
+
+**NEVER commit credentials, API keys, passwords, or tokens to the repository.**
+
+| Do This | Not This |
+|---------|----------|
+| `os.environ['SOURCE_COOP_KEY_ID']` | `aws_access_key_id='ASIAWCQM...'` |
+| `os.getenv('MAPTILER_API_KEY')` | `api_key = "pk.eyJ1..."` |
+| Reference docs: "see Source Cooperative console" | Paste actual credential values |
+
+**Rules:**
+1. **Environment variables**: Always use `os.environ` or `os.getenv()` for sensitive values
+2. **Documentation**: Reference where to obtain credentials, never include actual values
+3. **Code review**: Before committing, grep for patterns like `AKIA`, `sk-`, `pk.`, `token=`, `password=`
+4. **Example values**: Use obvious placeholders like `<your_key_here>` or `YOUR_API_KEY`
+
+**If credentials are accidentally committed:**
+1. Rotate the credential immediately (generate new key, revoke old one)
+2. Use BFG Repo-Cleaner to scrub from history:
+   ```bash
+   # Create secrets file with one credential per line
+   echo "ASIAWCQM3Z36DUTPFIRS" > /tmp/secrets.txt
+
+   # Clone mirror and scrub
+   git clone --mirror git@github.com:org/repo.git repo-mirror
+   bfg -rt /tmp/secrets.txt repo-mirror
+   cd repo-mirror && git reflog expire --expire=now --all && git gc --prune=now --aggressive
+   git push --force
+
+   # Reset local repo
+   cd ../repo && git fetch origin && git reset --hard origin/main
+   ```
+3. Clean up: `rm /tmp/secrets.txt`
+
 ## Development Approach
 
 - **Test-Driven Development Strategy**: 
