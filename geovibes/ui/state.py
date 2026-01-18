@@ -38,6 +38,11 @@ class AppState:
     detection_data: Optional[Dict[str, Any]] = None
     detection_labels: Dict[str, int] = field(default_factory=dict)
 
+    # Remote database loading state
+    database_loading: bool = False
+    database_ready: bool = True
+    loading_message: str = ""
+
     def set_label_mode(self, label: str) -> None:
         """Update the active label mode."""
         self.current_label = label
@@ -65,6 +70,9 @@ class AppState:
         self.detection_mode = False
         self.detection_data = None
         self.detection_labels.clear()
+        self.database_loading = False
+        self.database_ready = True
+        self.loading_message = ""
 
     def toggle_label(self, point_id: str, label: str) -> None:
         """Toggle the label for a point_id, ensuring exclusivity."""

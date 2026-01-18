@@ -313,7 +313,185 @@ class DataManager:
                 self.local_database_directory, self.manifest_entries
             )
         )
+
+        # Tier 4: Remote databases from S3 (if no local databases found)
+        if not discovered:
+            try:
+                remote_dbs = self.discover_remote_databases()
+                if remote_dbs:
+                    if self.verbose:
+                        print(
+                            f"📡 Found {len(remote_dbs)} remote databases (no local found)"
+                        )
+                    discovered.extend(remote_dbs)
+            except Exception as e:
+                if self.verbose:
+                    print(f"⚠️  Could not list remote databases: {e}")
+
         return discovered
+
+    def discover_remote_databases(self, base_url: str = None) -> List[Dict[str, Any]]:
+        """Scan S3 for available remote databases in httpfs/ folders.
+
+        Recursively scans from base_url to find all httpfs/ folders containing
+        database files (metadata.db, faiss.index, geometry_cache.parquet).
+
+        Args:
+            base_url: S3 URL to start scanning from. Defaults to
+                DatabaseConstants.DEFAULT_SEARCH_BASE_URL.
+
+        Returns:
+            List of database entries compatible with available_databases format.
+            Each entry includes is_remote=True flag.
+        """
+        import boto3
+        from botocore import UNSIGNED
+        from botocore.config import Config
+
+        base_url = base_url or DatabaseConstants.DEFAULT_SEARCH_BASE_URL
+
+        # Parse S3 URL
+        if not base_url.startswith("s3://"):
+            return []
+
+        # Extract bucket and prefix from URL
+        url_parts = base_url[5:].split("/", 1)
+        bucket = url_parts[0]
+        prefix = url_parts[1] if len(url_parts) > 1 else ""
+
+        if self.verbose:
+            print(f"🔍 Scanning for remote databases at {base_url}")
+
+        # Create S3 client (anonymous access for public bucket)
+        s3 = boto3.client(
+            "s3",
+            config=Config(signature_version=UNSIGNED),
+        )
+
+        discovered = []
+
+        # List all objects under the prefix to find httpfs/ folders
+        paginator = s3.get_paginator("list_objects_v2")
+        httpfs_folders = set()
+
+        for page in paginator.paginate(Bucket=bucket, Prefix=prefix):
+            for obj in page.get("Contents", []):
+                key = obj["Key"]
+                # Look for httpfs/ in the path
+                if "/httpfs/" in key:
+                    # Extract the httpfs folder path (e.g., .../httpfs/model_name/)
+                    httpfs_idx = key.index("/httpfs/")
+                    after_httpfs = key[httpfs_idx + 8 :]  # Skip "/httpfs/"
+                    if "/" in after_httpfs:
+                        model_folder = after_httpfs.split("/")[0]
+                        folder_path = key[: httpfs_idx + 8] + model_folder
+                        httpfs_folders.add(folder_path)
+
+        if self.verbose:
+            print(f"   Found {len(httpfs_folders)} model folders")
+
+        # For each httpfs folder, check for required files
+        for folder_path in sorted(httpfs_folders):
+            folder_prefix = folder_path + "/"
+
+            # List files in this folder
+            response = s3.list_objects_v2(
+                Bucket=bucket, Prefix=folder_prefix, Delimiter="/"
+            )
+            files = {obj["Key"].split("/")[-1] for obj in response.get("Contents", [])}
+
+            # Check for required files
+            has_db = "metadata.db" in files
+            has_faiss = "faiss.index" in files
+            has_geometry = "geometry_cache.parquet" in files
+
+            if not (has_db and has_faiss):
+                if self.verbose:
+                    print(f"   ⚠️  Skipping {folder_path} (missing required files)")
+                continue
+
+            # Build URLs
+            model_name = folder_path.split("/")[-1]
+            db_url = f"s3://{bucket}/{folder_prefix}metadata.db"
+            faiss_url = f"s3://{bucket}/{folder_prefix}faiss.index"
+            geometry_url = (
+                f"s3://{bucket}/{folder_prefix}geometry_cache.parquet"
+                if has_geometry
+                else None
+            )
+
+            # Extract region and date range from path for display
+            # Path format: .../USA/alabama/2024-01-01-2025-01-01/httpfs/model_name
+            path_parts = folder_path.split("/")
+            region = None
+            date_range = None
+            for i, part in enumerate(path_parts):
+                if part == "httpfs" and i >= 2:
+                    region = path_parts[i - 2]  # e.g., "alabama"
+                    date_range = path_parts[i - 1]  # e.g., "2024-01-01-2025-01-01"
+                    break
+
+            # Build display name
+            display_name = self._build_remote_display_name(
+                model_name, region, date_range
+            )
+
+            # Parse tile spec from model name
+            tile_spec = infer_tile_spec_from_name(model_name)
+
+            entry = {
+                "db_path": db_url,
+                "faiss_path": faiss_url,
+                "display_name": display_name,
+                "geometry_path": None,  # Remote DBs use geometry cache instead
+                "geometry_cache_path": geometry_url,
+                "tile_spec": tile_spec,
+                "is_remote": True,
+                "region": region,
+                "date_range": date_range,
+            }
+            discovered.append(entry)
+
+            if self.verbose:
+                print(f"   ✓ {display_name}")
+
+        return discovered
+
+    def _build_remote_display_name(
+        self, model_name: str, region: str = None, date_range: str = None
+    ) -> str:
+        """Build a human-readable display name for a remote database."""
+        # Extract model type from name
+        # e.g., "alabama_dino_vit_small_patch16_224_2024_2025_32_16_10"
+        # -> "DINO ViT (32px, 16px, 10m)"
+
+        # Parse tile spec for display
+        tile_spec = infer_tile_spec_from_name(model_name)
+        tile_info = ""
+        if tile_spec:
+            tile_info = f" ({tile_spec.get('tile_size_px', '?')}px)"
+
+        # Simplify model name for display
+        name_lower = model_name.lower()
+        if "dino_vit" in name_lower:
+            if "quantized" in name_lower:
+                model_type = "Quantized DINO ViT"
+            else:
+                model_type = "DINO ViT"
+        elif "earthgenome" in name_lower or "softcon" in name_lower:
+            model_type = "EarthGenome"
+        elif "google_satellite" in name_lower:
+            model_type = "Google Satellite"
+        else:
+            # Fallback: use first part of model name
+            model_type = model_name.split("_")[0].title()
+
+        # Build final display name
+        parts = [model_type + tile_info]
+        if region:
+            parts.append(region.replace("_", " ").title())
+
+        return " - ".join(parts)
 
     def _infer_faiss_from_db(self, db_path: str) -> Optional[str]:
         candidate = pathlib.Path(db_path)
@@ -960,7 +1138,7 @@ class DataManager:
         if DatabaseConstants.is_gcs_path(database_path) or DatabaseConstants.is_s3_path(
             database_path
         ):
-            self._warm_up_gcs_database()
+            self._warm_up_remote_database()
 
         self.effective_boundary_path, (self.center_y, self.center_x) = (
             self._setup_boundary_and_center()

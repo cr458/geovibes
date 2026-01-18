@@ -417,13 +417,17 @@ class GeoVibes:
 
         # Database dropdown with ipyvuetify
         if getattr(self.data, "available_databases", []):
-            db_items = [
-                {
-                    "text": entry.get("display_name", entry["db_path"]),
-                    "value": entry["db_path"],
-                }
-                for entry in self.data.available_databases
-            ]
+            db_items = []
+            for entry in self.data.available_databases:
+                display_name = entry.get("display_name", entry["db_path"])
+                if entry.get("is_remote"):
+                    display_name = f"{display_name} (Remote)"
+                db_items.append(
+                    {
+                        "text": display_name,
+                        "value": entry["db_path"],
+                    }
+                )
             self.database_dropdown = v.Select(
                 v_model=self.data.current_database_path,
                 items=db_items,
@@ -729,6 +733,18 @@ class GeoVibes:
         new_path = change["new"]
         if new_path == self.data.current_database_path:
             return
+
+        # Check if this is a remote database
+        db_info = self.data.database_info_by_path.get(new_path, {})
+        if db_info.get("is_remote"):
+            # Use progressive loading for remote databases
+            self._start_progressive_loading(db_info)
+        else:
+            # Synchronous loading for local databases
+            self._switch_database_sync(new_path)
+
+    def _switch_database_sync(self, new_path: str) -> None:
+        """Synchronously switch to a local database."""
         self._show_operation_status("🔄 Loading database...")
         try:
             self.data.switch_database(new_path)
@@ -749,6 +765,126 @@ class GeoVibes:
             self._show_operation_status("✅ Database loaded")
         finally:
             self._update_status()
+
+    def _start_progressive_loading(self, db_info: dict) -> None:
+        """Start progressive loading for a remote database.
+
+        1. Immediately connect to remote DB
+        2. Download FAISS index + geometry cache in background
+        3. Enable search when ready
+        """
+        import threading
+
+        from geovibes.database.faiss_cache import FaissCache
+
+        # Update loading state
+        self.state.database_loading = True
+        self.state.database_ready = False
+        self.state.loading_message = "Connecting..."
+
+        # Disable search button
+        self.search_btn.disabled = True
+        self.search_btn.children = ["Loading..."]
+
+        self._show_operation_status("📡 Connecting to remote database...")
+
+        db_url = db_info["db_path"]
+        faiss_url = db_info["faiss_path"]
+        geometry_url = db_info.get("geometry_cache_path")
+
+        def background_loader():
+            try:
+                # Step 1: Connect to remote DuckDB (fast)
+                self.state.loading_message = "Connecting to database..."
+                self.data.current_database_path = db_url
+                self.data.current_database_info = db_info
+                self.data.current_faiss_path = faiss_url
+                self.data.current_geometry_cache_path = geometry_url
+                self.data.tile_spec = db_info.get("tile_spec")
+
+                # Connect to remote DB
+                self.data.duckdb_connection = self.data._connect_duckdb(db_url)
+                self.data._apply_duckdb_settings(db_url)
+
+                # Step 2: Download FAISS index (slower)
+                self._show_operation_status("📥 Downloading FAISS index...")
+                self.state.loading_message = "Downloading FAISS index..."
+                cache = FaissCache()
+                self.data.faiss_index = cache.get_index(faiss_url, show_progress=True)
+                self.data.embedding_dim = self.data._detect_embedding_dim()
+
+                # Step 3: Download geometry cache (if available)
+                if geometry_url:
+                    self._show_operation_status("📥 Downloading geometry cache...")
+                    self.state.loading_message = "Downloading geometry cache..."
+                    self.data._load_geometry_cache(geometry_url)
+
+                # Step 4: Warm up database
+                self._show_operation_status("🔄 Warming up database...")
+                self.state.loading_message = "Warming up..."
+                self.data._warm_up_remote_database()
+
+                # Success - update UI on main thread
+                self._on_loading_complete(db_info)
+
+            except Exception as e:
+                self._on_loading_error(str(e))
+
+        # Start background thread
+        thread = threading.Thread(target=background_loader, daemon=True)
+        thread.start()
+
+    def _on_loading_complete(self, db_info: dict) -> None:
+        """Called when background loading finishes successfully."""
+        self.state.database_loading = False
+        self.state.database_ready = True
+        self.state.loading_message = ""
+
+        # Re-enable search button
+        self.search_btn.disabled = False
+        self.search_btn.children = [
+            v.Icon(small=True, class_="mr-2", children=["mdi-magnify"]),
+            "Search",
+        ]
+
+        # Update UI state
+        self.id_column_candidates = getattr(self.data, "id_column_candidates", ["id"])
+        self.external_id_column = getattr(self.data, "external_id_column", "id")
+
+        # Center map on database region
+        self.data.effective_boundary_path, (self.data.center_y, self.data.center_x) = (
+            self.data._setup_boundary_and_center()
+        )
+        self.map_manager.center_on(self.data.center_y, self.data.center_x)
+        self.map_manager.update_boundary_layer(self.data.effective_boundary_path)
+
+        # Reset labels and search state
+        self.reset_all()
+
+        # Update dropdown selection
+        if self.database_dropdown:
+            self.database_dropdown.v_model = db_info["db_path"]
+
+        self._show_operation_status("✅ Remote database ready")
+        self._update_status()
+
+    def _on_loading_error(self, error_message: str) -> None:
+        """Called when background loading fails."""
+        self.state.database_loading = False
+        self.state.database_ready = False
+        self.state.loading_message = ""
+
+        # Re-enable search button (but search won't work)
+        self.search_btn.disabled = False
+        self.search_btn.children = [
+            v.Icon(small=True, class_="mr-2", children=["mdi-magnify"]),
+            "Search",
+        ]
+
+        if self.verbose:
+            print(f"❌ Failed to load remote database: {error_message}")
+        self._show_operation_status(f"❌ Load failed: {error_message}")
+        self._update_status()
 
     def _on_detection_threshold_change(self, change) -> None:
         if not self.state.detection_mode or not self.state.detection_data:

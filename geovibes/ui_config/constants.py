@@ -214,6 +214,13 @@ class DatabaseConstants:
     LOAD httpfs;
     """
 
+    # Base URL for remote database discovery (scans all regions/dates)
+    DEFAULT_SEARCH_BASE_URL = "s3://us-west-2.opendata.source.coop/geovibes/search/"
+
+    # S3 endpoint for Source Cooperative
+    SOURCE_COOP_ENDPOINT = "https://data.source.coop"
+    SOURCE_COOP_BUCKET = "us-west-2.opendata.source.coop"
+
     @classmethod
     def get_memory_setup_queries(cls):
         """Get memory configuration queries."""
