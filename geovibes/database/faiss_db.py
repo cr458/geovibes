@@ -296,12 +296,25 @@ def ingest_parquet_to_duckdb(
         row_count = con.execute("SELECT COUNT(*) FROM geo_embeddings;").fetchone()[0]
         logging.info(f"Successfully ingested {row_count} rows into DuckDB.")
 
+        # Reorder table by id for optimal zone map performance over httpfs
+        logging.info("Reordering table by id for optimal remote query performance...")
+        con.execute(
+            "CREATE TABLE geo_embeddings_ordered AS SELECT * FROM geo_embeddings ORDER BY id"
+        )
+        con.execute("DROP TABLE geo_embeddings")
+        con.execute("ALTER TABLE geo_embeddings_ordered RENAME TO geo_embeddings")
+        logging.info("Table reordered successfully.")
+
         if has_geometry:
             logging.info("Creating R-Tree spatial index on geometry column...")
             con.execute(
                 "CREATE INDEX geom_spatial_idx ON geo_embeddings USING RTREE (geometry);"
             )
             logging.info("Spatial index created successfully.")
+
+        logging.info("Creating index on id column for fast lookups...")
+        con.execute("CREATE INDEX id_idx ON geo_embeddings(id);")
+        logging.info("ID index created successfully.")
 
         return embedding_dim
 
