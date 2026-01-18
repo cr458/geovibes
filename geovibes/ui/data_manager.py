@@ -12,6 +12,7 @@ import duckdb
 import faiss
 import geopandas as gpd
 
+from geovibes.database.faiss_cache import FaissCache
 from geovibes.ee_tools import initialize_ee_with_credentials
 from geovibes.ui_config import BasemapConfig, DatabaseConstants, GeoVibesConfig
 
@@ -47,6 +48,7 @@ class DataManager:
         start_date: Optional[str] = None,
         end_date: Optional[str] = None,
         duckdb_path: Optional[str] = None,
+        faiss_path: Optional[str] = None,
         duckdb_directory: Optional[str] = None,
         config: Optional[Dict] = None,
         enable_ee: Optional[bool] = None,
@@ -60,6 +62,7 @@ class DataManager:
         self.verbose = verbose
         self.baselayer_url = baselayer_url or BasemapConfig.BASEMAP_TILES["MAPTILER"]
         self.duckdb_path = duckdb_path
+        self.faiss_path = faiss_path
         self.duckdb_directory = duckdb_directory
 
         if "enable_ee" in unused_kwargs and self.verbose:
@@ -138,7 +141,7 @@ class DataManager:
             raise ValueError("Could not find a FAISS index for the selected database.")
         if self.verbose:
             print(f"🧠 Loading FAISS index from: {self.current_faiss_path}")
-        self.faiss_index = faiss.read_index(self.current_faiss_path)
+        self.faiss_index = self._load_faiss_index(self.current_faiss_path)
         if self.verbose:
             print(f"✅ FAISS index loaded. Contains {self.faiss_index.ntotal} vectors.")
 
@@ -226,7 +229,7 @@ class DataManager:
 
         db_path = self.duckdb_path or getattr(self.config, "duckdb_path", None)
         if db_path:
-            faiss_path = self._infer_faiss_from_db(db_path)
+            faiss_path = self.faiss_path or self._infer_faiss_from_db(db_path)
             if not faiss_path:
                 if self.verbose:
                     print(f"⚠️  Could not locate FAISS index for {db_path}. Skipping.")
@@ -535,6 +538,9 @@ class DataManager:
                 print("🔑 Using HMAC key authentication")
             else:
                 print("🔑 Using default Google Cloud authentication")
+        elif DatabaseConstants.is_s3_path(database_path) and self.verbose:
+            print(f"🌐 Connecting to S3 database: {database_path}")
+            print("🔑 Using AWS credentials from environment/config")
         elif self.verbose:
             print(f"💾 Connecting to local database: {database_path}")
 
@@ -555,6 +561,15 @@ class DataManager:
                     error_msg += (
                         "\n💡 Check your GCS authentication setup (see GCS_SETUP.md)"
                     )
+                raise RuntimeError(error_msg)
+            elif DatabaseConstants.is_s3_path(database_path):
+                error_msg = f"Failed to connect to S3 database: {exc}"
+                if (
+                    "authentication" in str(exc).lower()
+                    or "forbidden" in str(exc).lower()
+                    or "403" in str(exc)
+                ):
+                    error_msg += "\n💡 Check your AWS credentials (aws configure or environment variables)"
                 raise RuntimeError(error_msg)
             raise RuntimeError(f"Failed to connect to local database: {exc}")
 
@@ -684,6 +699,25 @@ class DataManager:
         )
         return None, (center_y, center_x)
 
+    def _load_faiss_index(self, faiss_path: str) -> faiss.Index:
+        """Load FAISS index from local path or S3 URL.
+
+        For S3 URLs, uses FaissCache to download and cache the index locally.
+
+        Args:
+            faiss_path: Local path or S3 URL to FAISS index
+
+        Returns:
+            Loaded FAISS index
+        """
+        if DatabaseConstants.is_s3_path(faiss_path):
+            if self.verbose:
+                print("📥 Downloading FAISS index from S3 (with caching)...")
+            cache = FaissCache()
+            return cache.get_index(faiss_path, show_progress=True)
+        else:
+            return faiss.read_index(faiss_path)
+
     # ------------------------------------------------------------------
     # Public API
     # ------------------------------------------------------------------
@@ -803,9 +837,11 @@ class DataManager:
                 f"No FAISS index recorded for {os.path.basename(database_path)}"
             )
 
-        self.faiss_index = faiss.read_index(self.current_faiss_path)
+        self.faiss_index = self._load_faiss_index(self.current_faiss_path)
         self.embedding_dim = self._detect_embedding_dim()
-        if DatabaseConstants.is_gcs_path(database_path):
+        if DatabaseConstants.is_gcs_path(database_path) or DatabaseConstants.is_s3_path(
+            database_path
+        ):
             self._warm_up_gcs_database()
 
         self.effective_boundary_path, (self.center_y, self.center_x) = (

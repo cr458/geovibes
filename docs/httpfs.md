@@ -1031,3 +1031,103 @@ If Phase 0 fails or Phase 1 has issues:
 - `geovibes/database/faiss_db.py` — FAISS index building
 - `tests/` — Test directory
 - `docs/data-formats.md` — DuckDB schema reference
+
+---
+
+## Phase 2: Performance Optimization (2025-01)
+
+### Problem: Full Table Scans Over httpfs
+
+Initial testing revealed that ID-based lookups were scanning all ~22M rows despite having a PRIMARY KEY constraint. Investigation uncovered two issues:
+
+1. **DuckDB PRIMARY KEY is NOT an index** — Unlike PostgreSQL, DuckDB's PRIMARY KEY is just a uniqueness constraint. An explicit `CREATE INDEX` is required for fast lookups.
+
+2. **Zone maps ineffective due to data ordering** — DuckDB uses min/max statistics per row group (~122K rows) to skip irrelevant data. But our data was stored in geographic (tile_id) order, causing ID ranges to overlap across all row groups:
+
+```
+# Unsorted data - overlapping ID ranges per row group
+Row Group 0: ids 3470 - 1018827
+Row Group 1: ids 16347 - 1230689
+Row Group 2: ids 8821 - 1442551
+→ Every query must scan ALL row groups
+```
+
+### Solution: Sort by ID + Add Index
+
+Added to `geovibes/database/faiss_db.py`:
+
+```python
+# Reorder table by id for optimal zone map performance over httpfs
+logging.info("Reordering table by id for optimal remote query performance...")
+con.execute("CREATE TABLE geo_embeddings_ordered AS SELECT * FROM geo_embeddings ORDER BY id")
+con.execute("DROP TABLE geo_embeddings")
+con.execute("ALTER TABLE geo_embeddings_ordered RENAME TO geo_embeddings")
+
+# Create explicit index
+logging.info("Creating index on id column for fast lookups...")
+con.execute("CREATE INDEX id_idx ON geo_embeddings(id);")
+```
+
+After sorting, row groups have non-overlapping ranges:
+```
+# Sorted data - non-overlapping ID ranges
+Row Group 0: ids 1 - 122880
+Row Group 1: ids 122881 - 245760
+Row Group 2: ids 245761 - 368640
+→ Zone maps can skip irrelevant row groups
+```
+
+### Performance Characteristics
+
+| Scenario | Latency | Notes |
+|----------|---------|-------|
+| First search (cold) | ~10-20s | Loading row groups from S3 |
+| Same row group (cached) | <1ms | DuckDB caches row groups in memory |
+| Sequential IDs (sorted DB) | Fast | Adjacent IDs share row groups |
+| 100 scattered FAISS IDs | ~18s | FAISS returns IDs by similarity, not storage order |
+
+**Fundamental limitation**: FAISS returns IDs ordered by embedding similarity, not storage order. Results inherently span multiple row groups, requiring ~500ms HTTP request per row group. Sorting helps with caching but can't eliminate this scatter.
+
+### S3 Database URLs
+
+Sorted databases uploaded to Source Cooperative:
+
+**Google Satellite Embeddings v1** (2.18M rows, 1.2GB):
+```
+s3://us-west-2.opendata.source.coop/geovibes/search/USA/alabama/2024-01-01-2025-01-01/alabama_google_satellite_embeddings_v1_2024_2025_25_0_10_metadata_sorted.db
+s3://us-west-2.opendata.source.coop/geovibes/search/USA/alabama/2024-01-01-2025-01-01/alabama_google_satellite_embeddings_v1_2024_2025_25_0_10_faiss_4096_64_8.index
+```
+
+**Quantized DINO ViT** (5.3M rows, 2.2GB):
+```
+s3://us-west-2.opendata.source.coop/geovibes/search/USA/alabama/2024-01-01-2025-01-01/alabama_quantized_dino_vit_small_patch16_224_2024_2025_32_16_10_metadata_sorted.db
+s3://us-west-2.opendata.source.coop/geovibes/search/USA/alabama/2024-01-01-2025-01-01/alabama_quantized_dino_vit_small_patch16_224_2024_2025_32_16_10_faiss_4096_64_8.index
+```
+
+### Usage: Direct S3 Database Access
+
+Added `faiss_path` parameter to `GeoVibes.create()` for explicit S3 paths:
+
+```python
+from geovibes import GeoVibes
+
+app = GeoVibes.create(
+    duckdb_path="s3://us-west-2.opendata.source.coop/geovibes/.../metadata_sorted.db",
+    faiss_path="s3://us-west-2.opendata.source.coop/geovibes/.../faiss_4096_64_8.index",
+    boundary_path="geometries/alabama.geojson",
+    verbose=True
+)
+app.display()
+```
+
+The FAISS index is automatically downloaded and cached at `~/.cache/geovibes/faiss/`.
+
+### Key Findings Summary
+
+| Finding | Impact |
+|---------|--------|
+| PRIMARY KEY ≠ Index in DuckDB | Must explicitly create indexes |
+| Data ordering affects zone maps | Sort by ID for optimal httpfs performance |
+| ~500ms per row group over httpfs | Fundamental network latency |
+| FAISS scatter unavoidable | Results span many row groups by design |
+| Caching helps repeat queries | Same row groups instant after first load |
