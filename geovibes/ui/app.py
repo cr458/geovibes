@@ -433,7 +433,9 @@ class GeoVibes:
             for entry in self.data.available_databases:
                 display_name = entry.get("display_name", entry["db_path"])
                 if entry.get("is_remote"):
-                    display_name = f"{display_name} (Remote)"
+                    display_name = f"Remote / {display_name}"
+                else:
+                    display_name = f"Local / {display_name}"
                 db_items.append(
                     {
                         "text": display_name,
