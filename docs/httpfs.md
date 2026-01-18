@@ -1276,11 +1276,20 @@ s3://us-west-2.opendata.source.coop/geovibes/search/USA/alabama/.../
 └── alabama_..._geometry_cache.parquet  # Geometry cache (NEW)
 ```
 
-### Generating Remaining Geometry Caches
+### Geometry Cache Status
 
-**Status:**
-- [x] `alabama_quantized_dino_vit_small_patch16_224_2024_2025_32_16_10_geometry_cache.parquet` - Uploaded
-- [ ] `alabama_google_satellite_embeddings_v1_2024_2025_25_0_10_geometry_cache.parquet` - TODO
+All geometry caches uploaded (2025-01-18):
+
+| Database | Geometry Cache | Size |
+|----------|---------------|------|
+| `alabama_dino_vit_small_patch16_224_2024_2025_32_16_10` | ✓ | 69 MB |
+| `alabama_earthgenome_softcon_2024_2025_32_16_10` | ✓ | 21 MB |
+| `alabama_google_satellite_embeddings_v1_2024_2025_25_0_10` | ✓ | 29 MB |
+| `alabama_quantized_dino_vit_small_patch16_224_2024_2025_32_16_10` | ✓ | 69 MB |
+
+### Generating New Geometry Caches
+
+For new databases, use the steps below.
 
 **Step 1: Clone repo and install dependencies**
 ```bash
