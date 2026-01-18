@@ -1108,11 +1108,23 @@ class GeoVibes:
         self._search_faiss()
 
     def _search_faiss(self) -> None:
+        import time
+
+        total_start = time.perf_counter()
+        log_to_file("=" * 60)
+        log_to_file("_search_faiss: START")
+
         n_neighbors = self.neighbors_slider.v_model
         all_labeled = self.state.pos_ids + self.state.neg_ids
         extra_results = min(len(all_labeled), n_neighbors // 2)
         total_requested = n_neighbors + extra_results
+        log_to_file(
+            f"_search_faiss: Requesting {total_requested} results (n_neighbors={n_neighbors})"
+        )
 
+        # Step 1: FAISS search
+        step_start = time.perf_counter()
+        log_to_file("_search_faiss: [1/3] Running FAISS search...")
         query_vector_np = self.state.query_vector.reshape(1, -1).astype("float32")
         params = faiss.SearchParametersIVF(nprobe=4096)
         self._show_operation_status(
@@ -1123,6 +1135,10 @@ class GeoVibes:
         )
         faiss_ids = ids[0].tolist()
         faiss_distances = distances[0].tolist()
+        step_time = (time.perf_counter() - step_start) * 1000
+        log_to_file(
+            f"_search_faiss: [1/3] FAISS search completed in {step_time:.1f}ms ({len(faiss_ids)} results)"
+        )
 
         if not faiss_ids:
             self._show_operation_status("✅ Search complete. No results found.")
@@ -1130,7 +1146,17 @@ class GeoVibes:
             self.tile_panel.clear()
             return
 
+        # Step 2: Query metadata from DuckDB
+        step_start = time.perf_counter()
+        log_to_file(
+            f"_search_faiss: [2/3] Querying metadata for {len(faiss_ids)} IDs..."
+        )
         metadata_df = self.data.query_search_metadata(faiss_ids)
+        step_time = (time.perf_counter() - step_start) * 1000
+        log_to_file(
+            f"_search_faiss: [2/3] Metadata query completed in {step_time:.1f}ms"
+        )
+
         if metadata_df is None or metadata_df.empty:
             self._show_operation_status("✅ Search complete. No results found.")
             self.map_manager.update_search_layer(self._empty_collection())
@@ -1142,7 +1168,18 @@ class GeoVibes:
         metadata_df = metadata_df.sort_values("sort_order").drop(columns=["sort_order"])
         metadata_df["distance"] = faiss_distances[: len(metadata_df)]
 
+        # Step 3: Process and display results
+        step_start = time.perf_counter()
+        log_to_file("_search_faiss: [3/3] Processing results...")
         self._process_search_results(metadata_df, n_neighbors)
+        step_time = (time.perf_counter() - step_start) * 1000
+        log_to_file(
+            f"_search_faiss: [3/3] Process results completed in {step_time:.1f}ms"
+        )
+
+        total_time = (time.perf_counter() - total_start) * 1000
+        log_to_file(f"_search_faiss: DONE total={total_time:.1f}ms")
+        log_to_file("=" * 60)
 
     def _process_search_results(
         self, results_df: pd.DataFrame, n_neighbors: int
