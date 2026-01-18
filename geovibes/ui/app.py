@@ -1484,6 +1484,8 @@ class GeoVibes:
     # ------------------------------------------------------------------
 
     def _fetch_embeddings(self, point_ids):
+        import time
+
         if not point_ids:
             return
 
@@ -1491,13 +1493,23 @@ class GeoVibes:
             pid for pid in point_ids if str(pid) not in self.state.cached_embeddings
         ]
 
+        log_to_file(
+            f"_fetch_embeddings: {len(point_ids)} requested, {len(uncached_ids)} uncached"
+        )
+
         if not uncached_ids:
+            log_to_file("_fetch_embeddings: 100% cache hit, skipping fetch")
             return
 
+        start = time.perf_counter()
+        count = 0
         for chunk_df in self.data.fetch_embeddings(uncached_ids):
             for _, row in chunk_df.iterrows():
                 point_id = str(row["id"])
                 self.state.cached_embeddings[point_id] = np.array(row["embedding"])
+                count += 1
+        elapsed = (time.perf_counter() - start) * 1000
+        log_to_file(f"_fetch_embeddings: Fetched {count} embeddings in {elapsed:.1f}ms")
 
     def _prefetch_embeddings_async(self, ids: list) -> None:
         """Pre-fetch embeddings for search results in background thread."""
