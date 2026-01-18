@@ -148,9 +148,9 @@ class DataManager:
         # Detect embedding dimension
         self.embedding_dim = self._detect_embedding_dim()
 
-        # Warm up if needed
-        if DatabaseConstants.is_gcs_path(self.current_database_path):
-            self._warm_up_gcs_database()
+        # Warm up remote databases to preload row groups
+        if self.is_remote_url(self.current_database_path):
+            self._warm_up_remote_database()
 
         # Derive map centering data
         self.effective_boundary_path, (self.center_y, self.center_x) = (
@@ -637,31 +637,51 @@ class DataManager:
                 print("⚠️ Using default dimension of 384")
             return 384
 
-    def _warm_up_gcs_database(self) -> None:
-        try:
-            if self.verbose:
-                print("🔧 Optimizing database connection...")
+    def _warm_up_remote_database(self) -> None:
+        """Warm up remote database by preloading row groups.
 
-            first_point_query = """
-            SELECT CAST(embedding AS FLOAT[]) as embedding 
-            FROM geo_embeddings 
-            WHERE embedding IS NOT NULL 
-            LIMIT 1
-            """
-            result = self.duckdb_connection.execute(first_point_query).fetchone()
-            if not result or not result[0]:
+        For httpfs databases, the first query to each row group is slow (~500ms).
+        This method preloads row groups by querying IDs spread across the database,
+        so subsequent user interactions are faster.
+        """
+        import time
+
+        try:
+            print("🔄 Warming up remote database (preloading data)...")
+            start = time.perf_counter()
+
+            # Get total count and ID range
+            stats = self.duckdb_connection.execute(
+                "SELECT COUNT(*), MIN(id), MAX(id) FROM geo_embeddings"
+            ).fetchone()
+            total_rows, min_id, max_id = stats
+
+            if not total_rows or total_rows == 0:
                 if self.verbose:
-                    print("⚠️  No embeddings found for warm-up")
+                    print("⚠️  No rows found for warm-up")
                 return
 
-            first_embedding = result[0]
-            sql = DatabaseConstants.get_similarity_search_light_query(
-                self.embedding_dim
-            )
-            query_params = [first_embedding, 100]
-            self.duckdb_connection.execute(sql, query_params).fetchall()
-            if self.verbose:
-                print("✅ Database optimization completed")
+            # Query IDs spread across the database to load multiple row groups
+            # Row groups are ~122K rows, so query every ~100K to hit different groups
+            row_group_size = 122880
+            n_groups_to_warm = min(10, (total_rows // row_group_size) + 1)
+            step = max(1, (max_id - min_id) // n_groups_to_warm)
+
+            sample_ids = [min_id + i * step for i in range(n_groups_to_warm)]
+            sample_ids = [id for id in sample_ids if id <= max_id]
+
+            if sample_ids:
+                placeholders = ",".join(["?" for _ in sample_ids])
+                warmup_query = f"""
+                SELECT id, geometry
+                FROM geo_embeddings
+                WHERE id IN ({placeholders})
+                """
+                self.duckdb_connection.execute(warmup_query, sample_ids).fetchall()
+
+            elapsed = time.perf_counter() - start
+            print(f"✅ Database ready ({elapsed:.1f}s)")
+
         except Exception as exc:
             if self.verbose:
                 print(f"⚠️  Database warm-up failed: {exc}")
