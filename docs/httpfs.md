@@ -1207,6 +1207,26 @@ def export_geometry_cache(con, output_path: str):
     """)
 ```
 
+#### Generating Geometry Cache
+
+**For new databases** — generated automatically by `faiss_db.py`:
+```bash
+python geovibes/database/faiss_db.py --roi-file ... --output_dir ...
+# Creates: *_metadata.db, *_faiss.index, *_geometry_cache.parquet
+```
+
+**For existing databases**:
+```python
+from geovibes.database.faiss_db import export_geometry_cache
+export_geometry_cache("/path/to/database.db", "/path/to/geometry_cache.parquet")
+```
+
+**Upload to S3**:
+```bash
+aws s3 cp /path/to/geometry_cache.parquet \
+    s3://us-west-2.opendata.source.coop/geovibes/search/.../name_geometry_cache.parquet
+```
+
 #### Usage (`data_manager.py`)
 
 ```python
