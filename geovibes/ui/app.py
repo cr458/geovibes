@@ -145,6 +145,7 @@ class GeoVibes:
         cls,
         duckdb_path: Optional[str] = None,
         faiss_path: Optional[str] = None,
+        geometry_cache_path: Optional[str] = None,
         duckdb_directory: Optional[str] = None,
         boundary_path: Optional[str] = None,
         start_date: str = "2024-01-01",
@@ -156,6 +157,7 @@ class GeoVibes:
         return cls(
             duckdb_path=duckdb_path,
             faiss_path=faiss_path,
+            geometry_cache_path=geometry_cache_path,
             duckdb_directory=duckdb_directory,
             boundary_path=boundary_path,
             start_date=start_date,
@@ -169,6 +171,7 @@ class GeoVibes:
         self,
         duckdb_path: Optional[str] = None,
         faiss_path: Optional[str] = None,
+        geometry_cache_path: Optional[str] = None,
         duckdb_directory: Optional[str] = None,
         boundary_path: Optional[str] = None,
         start_date: Optional[str] = None,
@@ -195,6 +198,7 @@ class GeoVibes:
         self.data = DataManager(
             duckdb_path=duckdb_path,
             faiss_path=faiss_path,
+            geometry_cache_path=geometry_cache_path,
             duckdb_directory=duckdb_directory,
             boundary_path=boundary_path,
             start_date=start_date,

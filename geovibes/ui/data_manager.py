@@ -49,6 +49,7 @@ class DataManager:
         end_date: Optional[str] = None,
         duckdb_path: Optional[str] = None,
         faiss_path: Optional[str] = None,
+        geometry_cache_path: Optional[str] = None,
         duckdb_directory: Optional[str] = None,
         config: Optional[Dict] = None,
         enable_ee: Optional[bool] = None,
@@ -63,6 +64,7 @@ class DataManager:
         self.baselayer_url = baselayer_url or BasemapConfig.BASEMAP_TILES["MAPTILER"]
         self.duckdb_path = duckdb_path
         self.faiss_path = faiss_path
+        self.geometry_cache_path = geometry_cache_path
         self.duckdb_directory = duckdb_directory
 
         if "enable_ee" in unused_kwargs and self.verbose:
@@ -147,6 +149,17 @@ class DataManager:
 
         # Detect embedding dimension
         self.embedding_dim = self._detect_embedding_dim()
+
+        # Load geometry cache for remote databases
+        self.current_geometry_cache_path = self.current_database_info.get(
+            "geometry_cache_path"
+        )
+        self._geometry_cache_local_path: Optional[pathlib.Path] = None
+        self._geometry_cache_connection: Optional[duckdb.DuckDBPyConnection] = None
+        if self.current_geometry_cache_path and self.is_remote_url(
+            self.current_database_path
+        ):
+            self._load_geometry_cache(self.current_geometry_cache_path)
 
         # Warm up remote databases to preload row groups
         if self.is_remote_url(self.current_database_path):
@@ -237,12 +250,17 @@ class DataManager:
                 geometry_path = self._infer_geometry_from_db(db_path)
                 if geometry_path is None:
                     geometry_path = getattr(self.config, "boundary_path", None)
+                geometry_cache = (
+                    self.geometry_cache_path
+                    or self._infer_geometry_cache_from_db(db_path)
+                )
                 discovered.append(
                     {
                         "db_path": db_path,
                         "faiss_path": faiss_path,
                         "display_name": os.path.basename(db_path),
                         "geometry_path": geometry_path,
+                        "geometry_cache_path": geometry_cache,
                     }
                 )
                 return discovered
@@ -345,6 +363,28 @@ class DataManager:
             geometry_path = self._resolve_geometry_path(candidate)
             if geometry_path:
                 return geometry_path
+        return None
+
+    def _infer_geometry_cache_from_db(self, db_path: str) -> Optional[str]:
+        """Infer the geometry cache Parquet URL from the database path.
+
+        For S3/GCS URLs, constructs the cache URL by replacing _metadata.db or .db
+        with _geometry_cache.parquet. For local paths, returns None (no cache needed).
+        """
+        if not db_path:
+            return None
+
+        # Only infer for remote databases
+        if not self.is_remote_url(db_path):
+            return None
+
+        # Construct geometry cache URL from database URL
+        # e.g., s3://bucket/path/name_metadata.db -> s3://bucket/path/name_geometry_cache.parquet
+        if db_path.endswith("_metadata.db"):
+            return db_path.replace("_metadata.db", "_geometry_cache.parquet")
+        elif db_path.endswith(".db"):
+            return db_path.replace(".db", "_geometry_cache.parquet")
+
         return None
 
     # ------------------------------------------------------------------
@@ -728,6 +768,42 @@ class DataManager:
         else:
             return faiss.read_index(faiss_path)
 
+    def _load_geometry_cache(self, geometry_cache_url: str) -> None:
+        """Download and connect to geometry cache for fast metadata queries.
+
+        For remote databases, the geometry cache is a small Parquet file containing
+        just id + geometry columns. This enables fast local queries instead of
+        fetching scattered IDs over httpfs.
+
+        Args:
+            geometry_cache_url: S3 or GCS URL to the geometry cache Parquet file
+        """
+        if self.verbose:
+            print("📥 Downloading geometry cache (with caching)...")
+
+        cache = FaissCache()
+        local_path = cache.get_geometry_cache(geometry_cache_url, show_progress=True)
+        self._geometry_cache_local_path = local_path
+
+        if self.verbose:
+            print(f"🗺️  Connecting to geometry cache: {local_path}")
+
+        # Create a separate DuckDB connection for geometry queries
+        self._geometry_cache_connection = duckdb.connect(":memory:")
+        self._geometry_cache_connection.execute("INSTALL spatial; LOAD spatial;")
+
+        # Create a view to query the Parquet file
+        self._geometry_cache_connection.execute(
+            f"CREATE VIEW geometry_cache AS SELECT * FROM '{local_path}'"
+        )
+
+        row_count = self._geometry_cache_connection.execute(
+            "SELECT COUNT(*) FROM geometry_cache"
+        ).fetchone()[0]
+
+        if self.verbose:
+            print(f"✅ Geometry cache ready ({row_count:,} geometries)")
+
     # ------------------------------------------------------------------
     # Public API
     # ------------------------------------------------------------------
@@ -738,6 +814,9 @@ class DataManager:
                 self.duckdb_connection.close()
                 if self.verbose:
                     print("🔌 DuckDB connection closed.")
+        if getattr(self, "_geometry_cache_connection", None):
+            self._geometry_cache_connection.close()
+            self._geometry_cache_connection = None
 
     def fetch_embeddings(self, point_ids: List[str], chunk_size: Optional[int] = None):
         if not point_ids:
@@ -813,6 +892,19 @@ class DataManager:
         if not faiss_ids:
             return None
         placeholders = ",".join(["?" for _ in faiss_ids])
+
+        # Use local geometry cache for remote databases (much faster)
+        if self._geometry_cache_connection is not None:
+            sql = f"""
+            SELECT id,
+                   ST_AsGeoJSON(geometry) AS geometry_json,
+                   ST_AsText(geometry) AS geometry_wkt
+            FROM geometry_cache
+            WHERE id IN ({placeholders})
+            """
+            return self._geometry_cache_connection.execute(sql, faiss_ids).fetchdf()
+
+        # Fall back to remote database query
         select_parts = ["id"]
         external_column = getattr(self, "external_id_column", "id")
         if external_column != "id":
