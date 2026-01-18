@@ -641,43 +641,33 @@ class DataManager:
         """Warm up remote database by preloading row groups.
 
         For httpfs databases, the first query to each row group is slow (~500ms).
-        This method preloads row groups by querying IDs spread across the database,
-        so subsequent user interactions are faster.
+        This method preloads data by:
+        1. Running a spatial nearest-point query (used when labeling points)
+        2. Fetching an embedding (used when updating the query vector)
+
+        This ensures the first user interaction is fast.
         """
         import time
 
         try:
-            print("🔄 Warming up remote database (preloading data)...")
+            print("🔄 Warming up remote database (this may take a moment)...")
             start = time.perf_counter()
 
-            # Get total count and ID range
-            stats = self.duckdb_connection.execute(
-                "SELECT COUNT(*), MIN(id), MAX(id) FROM geo_embeddings"
+            # Get database centroid for warmup queries
+            centroid = self.duckdb_connection.execute(
+                "SELECT AVG(ST_X(geometry)), AVG(ST_Y(geometry)) FROM geo_embeddings LIMIT 10000"
             ).fetchone()
-            total_rows, min_id, max_id = stats
+            center_lon, center_lat = centroid if centroid else (0, 0)
 
-            if not total_rows or total_rows == 0:
-                if self.verbose:
-                    print("⚠️  No rows found for warm-up")
-                return
-
-            # Query IDs spread across the database to load multiple row groups
-            # Row groups are ~122K rows, so query every ~100K to hit different groups
-            row_group_size = 122880
-            n_groups_to_warm = min(10, (total_rows // row_group_size) + 1)
-            step = max(1, (max_id - min_id) // n_groups_to_warm)
-
-            sample_ids = [min_id + i * step for i in range(n_groups_to_warm)]
-            sample_ids = [id for id in sample_ids if id <= max_id]
-
-            if sample_ids:
-                placeholders = ",".join(["?" for _ in sample_ids])
-                warmup_query = f"""
-                SELECT id, geometry
-                FROM geo_embeddings
-                WHERE id IN ({placeholders})
-                """
-                self.duckdb_connection.execute(warmup_query, sample_ids).fetchall()
+            # Warm up the nearest_point query (spatial scan + embedding fetch)
+            # This is the query that runs when user clicks to label a point
+            print("   Loading spatial index...", end="", flush=True)
+            spatial_start = time.perf_counter()
+            self.duckdb_connection.execute(
+                DatabaseConstants.NEAREST_POINT_QUERY, [center_lon, center_lat]
+            ).fetchone()
+            spatial_time = time.perf_counter() - spatial_start
+            print(f" done ({spatial_time:.1f}s)")
 
             elapsed = time.perf_counter() - start
             print(f"✅ Database ready ({elapsed:.1f}s)")
