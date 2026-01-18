@@ -58,9 +58,11 @@ class DataManager:
         baselayer_url: Optional[str] = None,
         disable_ee: bool = False,
         verbose: bool = False,
+        include_remote: bool = False,
         **unused_kwargs: Any,
     ) -> None:
         self.verbose = verbose
+        self.include_remote = include_remote
         self.baselayer_url = baselayer_url or BasemapConfig.BASEMAP_TILES["MAPTILER"]
         self.duckdb_path = duckdb_path
         self.faiss_path = faiss_path
@@ -314,15 +316,15 @@ class DataManager:
             )
         )
 
-        # Tier 4: Remote databases from S3 (if no local databases found)
-        if not discovered:
+        # Tier 4: Remote databases from S3
+        # Include if: (a) no local databases found, or (b) include_remote=True
+        if not discovered or self.include_remote:
             try:
                 remote_dbs = self.discover_remote_databases()
                 if remote_dbs:
                     if self.verbose:
-                        print(
-                            f"📡 Found {len(remote_dbs)} remote databases (no local found)"
-                        )
+                        msg = "alongside local" if discovered else "no local found"
+                        print(f"📡 Found {len(remote_dbs)} remote databases ({msg})")
                     discovered.extend(remote_dbs)
             except Exception as e:
                 if self.verbose:

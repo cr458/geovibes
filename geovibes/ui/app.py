@@ -152,6 +152,7 @@ class GeoVibes:
         end_date: str = "2025-01-01",
         verbose: bool = False,
         enable_ee: Optional[bool] = None,
+        include_remote: bool = False,
         **kwargs,
     ):
         return cls(
@@ -164,6 +165,7 @@ class GeoVibes:
             end_date=end_date,
             verbose=verbose,
             enable_ee=enable_ee,
+            include_remote=include_remote,
             **kwargs,
         )
 
@@ -183,6 +185,7 @@ class GeoVibes:
         disable_ee: bool = False,
         verbose: bool = False,
         enable_ee: Optional[bool] = None,
+        include_remote: bool = False,
         **unused_kwargs: Any,
     ) -> None:
         self.verbose = verbose
@@ -210,6 +213,7 @@ class GeoVibes:
             disable_ee=disable_ee,
             verbose=verbose,
             enable_ee=enable_ee,
+            include_remote=include_remote,
         )
         self.id_column_candidates = getattr(self.data, "id_column_candidates", ["id"])
         self.external_id_column = getattr(self.data, "external_id_column", "id")
