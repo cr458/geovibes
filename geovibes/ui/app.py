@@ -1399,6 +1399,8 @@ class GeoVibes:
         log_to_file(f"_search_faiss: DONE total={total_time:.1f}ms")
         log_to_file("=" * 60)
 
+        self._prefetch_embeddings_async(faiss_ids)
+
     def _process_search_results(
         self, results_df: pd.DataFrame, n_neighbors: int
     ) -> None:
@@ -1484,10 +1486,48 @@ class GeoVibes:
     def _fetch_embeddings(self, point_ids):
         if not point_ids:
             return
-        for chunk_df in self.data.fetch_embeddings(point_ids):
+
+        uncached_ids = [
+            pid for pid in point_ids if str(pid) not in self.state.cached_embeddings
+        ]
+
+        if not uncached_ids:
+            return
+
+        for chunk_df in self.data.fetch_embeddings(uncached_ids):
             for _, row in chunk_df.iterrows():
                 point_id = str(row["id"])
                 self.state.cached_embeddings[point_id] = np.array(row["embedding"])
+
+    def _prefetch_embeddings_async(self, ids: list) -> None:
+        """Pre-fetch embeddings for search results in background thread."""
+        import threading
+
+        uncached = [i for i in ids if str(i) not in self.state.cached_embeddings]
+        if not uncached:
+            log_to_file(f"prefetch: All {len(ids)} embeddings already cached")
+            return
+
+        log_to_file(
+            f"prefetch: Starting background fetch of {len(uncached)} embeddings"
+        )
+
+        def fetch_worker():
+            import time
+
+            start = time.perf_counter()
+            count = 0
+            for chunk_df in self.data.fetch_embeddings(uncached):
+                for _, row in chunk_df.iterrows():
+                    self.state.cached_embeddings[str(row["id"])] = np.array(
+                        row["embedding"]
+                    )
+                    count += 1
+            elapsed = (time.perf_counter() - start) * 1000
+            log_to_file(f"prefetch: Completed {count} embeddings in {elapsed:.1f}ms")
+
+        thread = threading.Thread(target=fetch_worker, daemon=True)
+        thread.start()
 
     def _update_layers(self) -> None:
         pos_geojson = self._geojson_for_ids(self.state.pos_ids)
