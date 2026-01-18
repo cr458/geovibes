@@ -778,7 +778,7 @@ class GeoVibes:
             self.external_id_column = getattr(self.data, "external_id_column", "id")
             self.map_manager.center_on(self.data.center_y, self.data.center_x)
             self.map_manager.update_boundary_layer(self.data.effective_boundary_path)
-            self.reset_all()
+            self.reset_all(clear_overlays=True)
             if self.database_dropdown:
                 self.database_dropdown.v_model = new_path
             # Enable search button (was disabled in deferred loading mode)
@@ -889,7 +889,7 @@ class GeoVibes:
         self.map_manager.update_boundary_layer(self.data.effective_boundary_path)
 
         # Reset labels and search state
-        self.reset_all()
+        self.reset_all(clear_overlays=True)
 
         # Update dropdown selection
         if self.database_dropdown:
