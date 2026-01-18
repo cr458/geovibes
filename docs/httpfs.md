@@ -1273,5 +1273,86 @@ After implementation, each database will have three files:
 s3://us-west-2.opendata.source.coop/geovibes/search/USA/alabama/.../
 ├── alabama_..._metadata_sorted.db      # Full database (embeddings + geometry)
 ├── alabama_..._faiss_4096_64_8.index   # FAISS index
-└── alabama_..._geometry.parquet        # Geometry cache (NEW)
+└── alabama_..._geometry_cache.parquet  # Geometry cache (NEW)
+```
+
+### Generating Remaining Geometry Caches
+
+**Status:**
+- [x] `alabama_quantized_dino_vit_small_patch16_224_2024_2025_32_16_10_geometry_cache.parquet` - Uploaded
+- [ ] `alabama_google_satellite_embeddings_v1_2024_2025_25_0_10_geometry_cache.parquet` - TODO
+
+**Step 1: Clone repo and install dependencies**
+```bash
+git clone git@github.com:cr458/geovibes.git
+cd geovibes
+uv venv && source .venv/bin/activate
+uv pip install -e .
+```
+
+**Step 2: Download the sorted database from S3**
+```bash
+# Set Source Cooperative read credentials
+export SOURCE_COOP_KEY_ID="<get from source.coop/geovibes>"
+export SOURCE_COOP_SECRET_KEY="<get from source.coop/geovibes>"
+
+# Download Google Satellite database
+aws s3 cp \
+  s3://us-west-2.opendata.source.coop/geovibes/search/USA/alabama/2024-01-01-2025-01-01/alabama_google_satellite_embeddings_v1_2024_2025_25_0_10_metadata_sorted.db \
+  /tmp/alabama_google_satellite_embeddings_v1_2024_2025_25_0_10_metadata_sorted.db
+```
+
+**Step 3: Generate the geometry cache**
+```python
+# generate_geometry_cache.py
+import duckdb
+
+db_path = "/tmp/alabama_google_satellite_embeddings_v1_2024_2025_25_0_10_metadata_sorted.db"
+output_path = "/tmp/alabama_google_satellite_embeddings_v1_2024_2025_25_0_10_geometry_cache.parquet"
+
+con = duckdb.connect(db_path, read_only=True)
+con.execute("INSTALL spatial; LOAD spatial;")
+
+print(f"Exporting geometry cache from {db_path}...")
+con.execute(f"""
+    COPY (SELECT id, geometry FROM geo_embeddings ORDER BY id)
+    TO '{output_path}' (FORMAT PARQUET, COMPRESSION ZSTD)
+""")
+print(f"Created {output_path}")
+con.close()
+```
+
+Run with:
+```bash
+uv run python generate_geometry_cache.py
+```
+
+**Step 4: Upload to S3**
+
+Get write credentials from Source Cooperative console, then:
+```bash
+# Set session credentials from Source Cooperative console
+export AWS_ACCESS_KEY_ID="ASIA..."
+export AWS_SECRET_ACCESS_KEY="..."
+export AWS_SESSION_TOKEN="..."
+export AWS_DEFAULT_REGION="us-west-2"
+
+# Upload (use direct AWS endpoint for writes)
+aws s3 cp \
+  /tmp/alabama_google_satellite_embeddings_v1_2024_2025_25_0_10_geometry_cache.parquet \
+  s3://us-west-2.opendata.source.coop/geovibes/search/USA/alabama/2024-01-01-2025-01-01/alabama_google_satellite_embeddings_v1_2024_2025_25_0_10_geometry_cache.parquet
+
+# Verify upload
+aws s3 ls s3://us-west-2.opendata.source.coop/geovibes/search/USA/alabama/2024-01-01-2025-01-01/ | grep geometry_cache
+```
+
+**Step 5: Verify the file works**
+```python
+import duckdb
+con = duckdb.connect()
+con.execute("INSTALL spatial; LOAD spatial;")
+df = con.execute("""
+    SELECT COUNT(*) as cnt FROM read_parquet('/tmp/alabama_google_satellite_embeddings_v1_2024_2025_25_0_10_geometry_cache.parquet')
+""").fetchdf()
+print(f"Row count: {df['cnt'][0]}")  # Should be ~2.18M for Google Satellite
 ```
