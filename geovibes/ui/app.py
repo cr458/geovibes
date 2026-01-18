@@ -261,14 +261,17 @@ class GeoVibes:
         css_widget = HTML(SIDE_PANEL_CSS)
 
         # Search section with ipyvuetify (style L: full-width search + icon button)
+        # Disabled until a database is connected (deferred loading mode)
+        search_disabled = not self.data.is_connected()
         self.search_btn = v.Btn(
             block=True,
             color="primary",
             depressed=True,
+            disabled=search_disabled,
             class_="search-btn",
             children=[
                 v.Icon(small=True, class_="mr-2", children=["mdi-magnify"]),
-                "Search",
+                "Search" if not search_disabled else "Select Database",
             ],
         )
         self.tiles_button = v.Btn(
@@ -422,6 +425,11 @@ class GeoVibes:
         # Database dropdown with ipyvuetify
         if getattr(self.data, "available_databases", []):
             db_items = []
+            # Add placeholder when in deferred loading mode (no database connected yet)
+            if not self.data.is_connected():
+                db_items.append(
+                    {"text": "Select a database...", "value": None, "disabled": True}
+                )
             for entry in self.data.available_databases:
                 display_name = entry.get("display_name", entry["db_path"])
                 if entry.get("is_remote"):
@@ -432,12 +440,19 @@ class GeoVibes:
                         "value": entry["db_path"],
                     }
                 )
+            # Start with no selection in deferred mode, or current path otherwise
+            initial_value = (
+                None
+                if not self.data.is_connected()
+                else self.data.current_database_path
+            )
             self.database_dropdown = v.Select(
-                v_model=self.data.current_database_path,
+                v_model=initial_value,
                 items=db_items,
                 dense=True,
                 outlined=True,
                 hide_details=True,
+                label="Database" if not self.data.is_connected() else None,
             )
         else:
             self.database_dropdown = None
@@ -735,7 +750,8 @@ class GeoVibes:
 
     def _on_database_change(self, change) -> None:
         new_path = change["new"]
-        if new_path == self.data.current_database_path:
+        # Skip if no selection (placeholder selected) or same as current
+        if not new_path or new_path == self.data.current_database_path:
             return
 
         # Check if this is a remote database
@@ -751,7 +767,11 @@ class GeoVibes:
         """Synchronously switch to a local database."""
         self._show_operation_status("🔄 Loading database...")
         try:
-            self.data.switch_database(new_path)
+            # Use connect_to_database for initial connection, switch_database for switching
+            if not self.data.is_connected():
+                self.data.connect_to_database(new_path)
+            else:
+                self.data.switch_database(new_path)
             self.id_column_candidates = getattr(
                 self.data, "id_column_candidates", ["id"]
             )
@@ -761,6 +781,12 @@ class GeoVibes:
             self.reset_all()
             if self.database_dropdown:
                 self.database_dropdown.v_model = new_path
+            # Enable search button (was disabled in deferred loading mode)
+            self.search_btn.disabled = False
+            self.search_btn.children = [
+                v.Icon(small=True, class_="mr-2", children=["mdi-magnify"]),
+                "Search",
+            ]
         except Exception as exc:
             if self.verbose:
                 print(f"❌ Failed to switch database: {exc}")

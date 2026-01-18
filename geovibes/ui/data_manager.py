@@ -120,11 +120,56 @@ class DataManager:
             entry["db_path"]: entry for entry in self.available_databases
         }
 
-        self.current_database_info = self.available_databases[0]
-        self.current_database_path = self.current_database_info["db_path"]
-        self.current_faiss_path = self.current_database_info.get("faiss_path")
-        self.current_geometry_path = self.current_database_info.get("geometry_path")
-        self.tile_spec = self.current_database_info.get("tile_spec")
+        # Initialize connection state variables
+        self.current_database_info: Optional[Dict] = None
+        self.current_database_path: Optional[str] = None
+        self.current_faiss_path: Optional[str] = None
+        self.current_geometry_path: Optional[str] = None
+        self.current_geometry_cache_path: Optional[str] = None
+        self.tile_spec: Optional[Dict] = None
+        self.effective_boundary_path: Optional[str] = None
+        self.duckdb_connection: Optional[duckdb.DuckDBPyConnection] = None
+        self._owns_connection = False
+        self.faiss_index: Optional[faiss.Index] = None
+        self.embedding_dim: Optional[int] = None
+        self._geometry_cache_local_path: Optional[pathlib.Path] = None
+        self._geometry_cache_connection: Optional[duckdb.DuckDBPyConnection] = None
+        self.center_x: float = 0.0
+        self.center_y: float = 0.0
+
+        # Deferred loading: skip connection when include_remote=True
+        # User will select a database from dropdown, then we connect
+        if self.include_remote:
+            if self.verbose:
+                print("📋 Deferred loading enabled - select a database to connect")
+            return
+
+        # Immediate loading: connect to first database
+        first_db = self.available_databases[0]
+        self._connect_to_database_internal(first_db, duckdb_connection)
+
+    # ------------------------------------------------------------------
+    # Database connection
+    # ------------------------------------------------------------------
+
+    def connect_to_database(self, db_path: str) -> None:
+        """Connect to a database by path. Used for deferred loading."""
+        db_info = self.database_info_by_path.get(db_path)
+        if not db_info:
+            raise ValueError(f"Unknown database: {db_path}")
+        self._connect_to_database_internal(db_info, duckdb_connection=None)
+
+    def _connect_to_database_internal(
+        self,
+        db_info: Dict,
+        duckdb_connection: Optional[duckdb.DuckDBPyConnection] = None,
+    ) -> None:
+        """Internal method to connect to a database."""
+        self.current_database_info = db_info
+        self.current_database_path = db_info["db_path"]
+        self.current_faiss_path = db_info.get("faiss_path")
+        self.current_geometry_path = db_info.get("geometry_path")
+        self.tile_spec = db_info.get("tile_spec")
         if not self.tile_spec:
             self.tile_spec = infer_tile_spec_from_name(self.current_database_path)
         self.effective_boundary_path = None
@@ -153,11 +198,9 @@ class DataManager:
         self.embedding_dim = self._detect_embedding_dim()
 
         # Load geometry cache for remote databases
-        self.current_geometry_cache_path = self.current_database_info.get(
-            "geometry_cache_path"
-        )
-        self._geometry_cache_local_path: Optional[pathlib.Path] = None
-        self._geometry_cache_connection: Optional[duckdb.DuckDBPyConnection] = None
+        self.current_geometry_cache_path = db_info.get("geometry_cache_path")
+        self._geometry_cache_local_path = None
+        self._geometry_cache_connection = None
         if self.current_geometry_cache_path and self.is_remote_url(
             self.current_database_path
         ):
@@ -171,6 +214,10 @@ class DataManager:
         self.effective_boundary_path, (self.center_y, self.center_x) = (
             self._setup_boundary_and_center()
         )
+
+    def is_connected(self) -> bool:
+        """Check if a database is currently connected."""
+        return self.duckdb_connection is not None
 
     # ------------------------------------------------------------------
     # Configuration helpers
@@ -441,12 +488,18 @@ class DataManager:
             # Parse tile spec from model name
             tile_spec = infer_tile_spec_from_name(model_name)
 
+            # Build boundary URL from region
+            boundary_url = None
+            if region:
+                boundary_url = f"s3://{DatabaseConstants.SOURCE_COOP_BUCKET}/geovibes/geometries/{region}.geojson"
+
             entry = {
                 "db_path": db_url,
                 "faiss_path": faiss_url,
                 "display_name": display_name,
                 "geometry_path": None,  # Remote DBs use geometry cache instead
                 "geometry_cache_path": geometry_url,
+                "boundary_url": boundary_url,
                 "tile_spec": tile_spec,
                 "is_remote": True,
                 "region": region,
@@ -909,6 +962,16 @@ class DataManager:
         ):
             boundary_path = self.current_database_info.get("geometry_path")
 
+        # For remote databases, fetch boundary from S3 if available
+        if (
+            not boundary_path
+            and self.current_database_info
+            and self.current_database_info.get("boundary_url")
+        ):
+            boundary_path = self._fetch_remote_boundary(
+                self.current_database_info["boundary_url"]
+            )
+
         if boundary_path:
             try:
                 boundary_gdf = gpd.read_file(boundary_path)
@@ -928,6 +991,43 @@ class DataManager:
             self.duckdb_connection, verbose=self.verbose
         )
         return None, (center_y, center_x)
+
+    def _fetch_remote_boundary(self, boundary_url: str) -> Optional[str]:
+        """Fetch and cache a remote boundary GeoJSON file."""
+        import hashlib
+
+        import fsspec
+
+        # Create cache directory
+        cache_dir = pathlib.Path.home() / ".cache" / "geovibes" / "boundaries"
+        cache_dir.mkdir(parents=True, exist_ok=True)
+
+        # Generate cache filename from URL hash
+        url_hash = hashlib.md5(boundary_url.encode()).hexdigest()[:16]
+        # Extract filename from URL for readability
+        url_filename = boundary_url.split("/")[-1]
+        cache_path = cache_dir / f"{url_hash}_{url_filename}"
+
+        if cache_path.exists():
+            if self.verbose:
+                print(f"📍 Using cached boundary: {cache_path}")
+            return str(cache_path)
+
+        if self.verbose:
+            print(f"📥 Downloading boundary from {boundary_url}...")
+
+        try:
+            # Use fsspec to handle S3 URLs
+            with fsspec.open(boundary_url, "rb", anon=True) as f:
+                content = f.read()
+            cache_path.write_bytes(content)
+            if self.verbose:
+                print(f"📍 Cached boundary to: {cache_path}")
+            return str(cache_path)
+        except Exception as exc:
+            if self.verbose:
+                print(f"⚠️  Could not fetch boundary from {boundary_url}: {exc}")
+            return None
 
     def _load_faiss_index(self, faiss_path: str) -> faiss.Index:
         """Load FAISS index from local path or S3 URL.
