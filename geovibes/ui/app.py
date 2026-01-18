@@ -137,6 +137,66 @@ if not BasemapConfig.MAPTILER_API_KEY:
     )
 
 
+def group_databases_by_region(databases: List[Dict]) -> Dict[str, List[Dict]]:
+    """Group database entries by their region.
+
+    Args:
+        databases: List of database entry dictionaries with 'region' key
+
+    Returns:
+        Dictionary mapping region names to lists of database entries
+    """
+    grouped: Dict[str, List[Dict]] = {}
+    for db in databases:
+        region = db.get("region", "Other")
+        if region not in grouped:
+            grouped[region] = []
+        grouped[region].append(db)
+    return grouped
+
+
+def build_grouped_dropdown_items(
+    databases: List[Dict], include_placeholder: bool = False
+) -> List[Dict]:
+    """Build dropdown items with region headers and dividers.
+
+    Args:
+        databases: List of database entry dictionaries
+        include_placeholder: If True, add "Select a database..." placeholder at start
+
+    Returns:
+        List of dropdown items with headers, items, and dividers
+    """
+    items: List[Dict] = []
+
+    if include_placeholder:
+        items.append({"text": "Select a database...", "value": None, "disabled": True})
+
+    grouped = group_databases_by_region(databases)
+
+    # Sort regions alphabetically
+    sorted_regions = sorted(grouped.keys())
+
+    for i, region in enumerate(sorted_regions):
+        # Add divider before all regions except the first (and after placeholder if present)
+        if i > 0:
+            items.append({"divider": True})
+
+        # Add header with capitalized region name
+        items.append({"header": region.title()})
+
+        # Add database items for this region
+        for db in grouped[region]:
+            display_name = db.get("display_name", db["db_path"])
+            if db.get("is_remote"):
+                display_name = f"Remote / {display_name}"
+            else:
+                display_name = f"Local / {display_name}"
+            items.append({"text": display_name, "value": db["db_path"]})
+
+    return items
+
+
 class GeoVibes:
     """Interactive map interface for geospatial similarity search."""
 
@@ -422,26 +482,12 @@ class GeoVibes:
             ],
         )
 
-        # Database dropdown with ipyvuetify
+        # Database dropdown with ipyvuetify (grouped by region)
         if getattr(self.data, "available_databases", []):
-            db_items = []
-            # Add placeholder when in deferred loading mode (no database connected yet)
-            if not self.data.is_connected():
-                db_items.append(
-                    {"text": "Select a database...", "value": None, "disabled": True}
-                )
-            for entry in self.data.available_databases:
-                display_name = entry.get("display_name", entry["db_path"])
-                if entry.get("is_remote"):
-                    display_name = f"Remote / {display_name}"
-                else:
-                    display_name = f"Local / {display_name}"
-                db_items.append(
-                    {
-                        "text": display_name,
-                        "value": entry["db_path"],
-                    }
-                )
+            include_placeholder = not self.data.is_connected()
+            db_items = build_grouped_dropdown_items(
+                self.data.available_databases, include_placeholder=include_placeholder
+            )
             # Start with no selection in deferred mode, or current path otherwise
             initial_value = (
                 None

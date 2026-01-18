@@ -20,7 +20,7 @@ def test_switch_database_updates_boundary_path(monkeypatch):
     monkeypatch.setattr(DataManager, "_connect_duckdb", lambda self, path: "conn")
     monkeypatch.setattr(DataManager, "_apply_duckdb_settings", lambda self, path: None)
     monkeypatch.setattr(DataManager, "_detect_embedding_dim", lambda self: 1)
-    monkeypatch.setattr(DataManager, "_warm_up_gcs_database", lambda self: None)
+    monkeypatch.setattr(DataManager, "_warm_up_remote_database", lambda self: None)
     monkeypatch.setattr(faiss, "read_index", lambda path: f"loaded:{path}")
 
     def fake_setup_boundary_and_center(self):
