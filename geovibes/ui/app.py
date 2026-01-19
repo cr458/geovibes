@@ -1582,7 +1582,7 @@ class GeoVibes:
         elapsed = (time.perf_counter() - start) * 1000
         log_to_file(f"_fetch_embeddings: Fetched {count} embeddings in {elapsed:.1f}ms")
 
-    def _prefetch_embeddings_async(self, ids: list, n_workers: int = 16) -> None:
+    def _prefetch_embeddings_async(self, ids: list, n_workers: int = 32) -> None:
         """Pre-fetch embeddings using row-group-aware parallel batching.
 
         Groups IDs by DuckDB row group (id // 122880) to minimize HTTP requests,
@@ -1614,7 +1614,7 @@ class GeoVibes:
             rg_groups[int(id_) // ROW_GROUP_SIZE].append(id_)
         batches = list(rg_groups.values())
 
-        actual_workers = min(n_workers, len(batches), 32)
+        actual_workers = min(n_workers, len(batches), 48)
         log_to_file(
             f"prefetch: {len(uncached)} embeddings across {len(batches)} row groups "
             f"({actual_workers} workers)"
@@ -1624,6 +1624,8 @@ class GeoVibes:
             import time
 
             start = time.perf_counter()
+            n_batches = len(batches)
+            completed_batches = [0]  # Use list to allow mutation in nested func
 
             def fetch_batch(batch_ids):
                 if not batch_ids:
@@ -1647,6 +1649,25 @@ class GeoVibes:
                     chunk_result = future.result()
                     self.state.cached_embeddings.update(chunk_result)
                     total_count += len(chunk_result)
+                    completed_batches[0] += 1
+
+                    # Update progress periodically
+                    if (
+                        completed_batches[0] % 5 == 0
+                        or completed_batches[0] == n_batches
+                    ):
+                        pct = int(100 * completed_batches[0] / n_batches)
+                        try:
+                            import asyncio
+
+                            loop = asyncio.get_event_loop()
+                            loop.call_soon_threadsafe(
+                                lambda p=pct: self._show_operation_status(
+                                    f"⏳ Loading embeddings... {p}%"
+                                )
+                            )
+                        except RuntimeError:
+                            pass
 
             elapsed = (time.perf_counter() - start) * 1000
             log_to_file(
