@@ -291,6 +291,7 @@ class DatabaseConstants:
         if cls.is_gcs_path(duckdb_path):
             # For GCS paths, create in-memory connection and attach remote database
             conn = duckdb.connect(":memory:")
+            conn.execute("SET enable_progress_bar = false;")
 
             # Install and load httpfs extension
             conn.execute(cls.HTTPFS_EXTENSION_SETUP_QUERY)
@@ -311,6 +312,7 @@ class DatabaseConstants:
         elif cls.is_s3_path(duckdb_path):
             # For S3 paths, create in-memory connection and attach remote database
             conn = duckdb.connect(":memory:")
+            conn.execute("SET enable_progress_bar = false;")
 
             # Install and load required extensions
             conn.execute("INSTALL httpfs; LOAD httpfs;")

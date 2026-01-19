@@ -1603,7 +1603,7 @@ class GeoVibes:
         # Group IDs by row group for optimal httpfs performance
         rg_groups = defaultdict(list)
         for id_ in uncached:
-            rg_groups[id_ // ROW_GROUP_SIZE].append(id_)
+            rg_groups[int(id_) // ROW_GROUP_SIZE].append(id_)
         batches = list(rg_groups.values())
 
         actual_workers = min(n_workers, len(batches), 32)
