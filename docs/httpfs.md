@@ -1524,3 +1524,80 @@ Benchmark on DINO ViT database (5.3M rows, **384-dim** embeddings = 1.5KB each):
 See `blog_figures/embedding_fetch_optimization.png` for benchmark visualization.
 
 ![Embedding Fetch Optimization](../blog_figures/embedding_fetch_optimization.png)
+
+---
+
+## Phase 5: Cluster-Aligned Storage Analysis (2025-01)
+
+### Hypothesis: Semantic Storage Ordering
+
+FAISS IVF assigns each embedding to a cluster based on proximity to centroids. If we stored embeddings sorted by cluster ID instead of insertion order, search results (which come from similar clusters) would be co-located in fewer row groups.
+
+### Benchmark Setup
+
+Database: DINO ViT (5.3M vectors, 384-dim, 4096 clusters)
+Query: 500 nearest neighbors to a test vector
+
+### Finding 1: Cluster Distribution in Search Results
+
+| nprobe | Clusters Hit | Current Row Groups | Cluster-Aligned Row Groups | Improvement |
+|--------|--------------|--------------------|-----------------------------|-------------|
+| 16 | 16 | 43 | 14 | **3.1x** |
+| 64 | 35 | 44 | 27 | 1.6x |
+| 256 | 36 | 44 | 28 | 1.6x |
+| 4096 | 36 | 44 | 28 | 1.6x |
+
+**Key insight**: Lower nprobe concentrates results in fewer clusters → better locality.
+
+### Finding 2: Hilbert-Ordered Clusters
+
+Random cluster ordering means semantically similar clusters may have distant IDs. By reordering clusters using a Hilbert space-filling curve (based on PCA projection of centroids), nearby clusters get consecutive IDs.
+
+| nprobe | Clusters Hit | Random Order RGs | Hilbert Order RGs | Improvement |
+|--------|--------------|------------------|-------------------|-------------|
+| 16 | 16 | 14 | 6 | 2.3x |
+| 64 | 35 | 27 | 8 | **3.4x** |
+| 256 | 36 | 28 | 8 | **3.5x** |
+| 1024 | 36 | 28 | 8 | **3.5x** |
+
+### Combined Impact
+
+| Storage Strategy | Row Groups | vs Current |
+|------------------|------------|------------|
+| Current (by ID) | 44 | 1x |
+| Cluster-aligned (random order) | 28 | 1.6x |
+| **Cluster-aligned (Hilbert order)** | **8** | **5.5x** |
+
+**Estimated impact**: Embedding fetch could go from ~31s to ~6s with Hilbert-ordered cluster storage.
+
+### Implementation Considerations
+
+**To implement cluster-aligned storage:**
+
+1. **Build time**: After FAISS training, assign each embedding to its cluster:
+   ```python
+   _, cluster_ids = index.quantizer.search(embeddings, 1)
+   ```
+
+2. **Hilbert ordering**: Project centroids to 2D via PCA, compute Hilbert distance, reorder:
+   ```python
+   centroids = quantizer.reconstruct_n(0, quantizer.ntotal)
+   centroids_2d = PCA(n_components=2).fit_transform(centroids)
+   hilbert_order = compute_hilbert_order(centroids_2d)
+   cluster_to_new_id = {old: new for new, old in enumerate(hilbert_order)}
+   ```
+
+3. **Sort embeddings**: Sort database rows by `(new_cluster_id, original_id)` before export.
+
+**Trade-offs:**
+- Requires rebuilding databases (one-time cost)
+- IDs change → existing saved datasets incompatible
+- ~30% PCA explained variance for 384-dim → Hilbert ordering may be suboptimal
+
+### Recommendation
+
+For new databases, especially those expected to be queried remotely:
+
+1. **Always use cluster-aligned storage** - 1.6x improvement with no downside
+2. **Consider Hilbert ordering** - Additional 3.5x improvement if PCA explains ≥50% variance
+3. **Tune nprobe** - Lower nprobe values maximize cluster locality benefits
