@@ -1496,8 +1496,28 @@ def _prefetch_embeddings_async(self, ids: list, n_workers: int = 16) -> None:
 1. **DuckDB `SET threads` doesn't help for httpfs** - Threads share one HTTP session
 2. **Multiple connections = true parallelism** - Each connection has its own HTTP session
 3. **Row-group batching is critical** - Grouping by `id // 122880` reduces redundant reads
-4. **Optimal workers ≈ 16** - Beyond that, overhead increases without benefit
+4. **Optimal workers ≈ 32** - For larger databases, more parallelism helps
 5. **Scaling is safe** - Row groups are bounded by database structure (~44 for 5.3M rows)
+
+### Impact of Embedding Dimension
+
+Benchmark on DINO ViT database (5.3M rows, **384-dim** embeddings = 1.5KB each):
+
+| Workers | Time (500 embeddings) |
+|---------|----------------------|
+| 8 | 70.5s |
+| 16 | 39.8s |
+| **32** | **33.6s** ← optimal |
+| 44 | 43.3s |
+
+**Key insight**: Embedding dimension significantly impacts performance. The 384-dim DINO ViT embeddings are ~4x larger than quantized alternatives, resulting in longer fetch times.
+
+**Throughput analysis**: Effective throughput of 0.02 MB/s indicates **latency is the bottleneck**, not bandwidth. Each row group requires a separate HTTP round-trip (~500-800ms), and with 44 row groups scattered across the database, this dominates total time.
+
+**Recommendations for large embeddings**:
+1. Use quantized embeddings (INT8) when possible - 4x smaller
+2. Consider local embedding cache for frequently-accessed databases
+3. Increase parallelism to 32 workers for IO-bound operations
 
 ### Visualization
 
