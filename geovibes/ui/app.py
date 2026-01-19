@@ -1511,40 +1511,58 @@ class GeoVibes:
         elapsed = (time.perf_counter() - start) * 1000
         log_to_file(f"_fetch_embeddings: Fetched {count} embeddings in {elapsed:.1f}ms")
 
-    def _prefetch_embeddings_async(self, ids: list) -> None:
-        """Pre-fetch embeddings for search results in background thread."""
+    def _prefetch_embeddings_async(self, ids: list, n_workers: int = 6) -> None:
+        """Pre-fetch embeddings for search results using parallel connections."""
         import threading
+        from concurrent.futures import ThreadPoolExecutor, as_completed
 
         uncached = [i for i in ids if str(i) not in self.state.cached_embeddings]
         if not uncached:
             log_to_file(f"prefetch: All {len(ids)} embeddings already cached")
             return
 
-        bg_connection = self.data.create_background_connection()
-        if bg_connection is None:
-            log_to_file("prefetch: Could not create background connection")
-            return
-
         log_to_file(
-            f"prefetch: Starting background fetch of {len(uncached)} embeddings"
+            f"prefetch: Starting parallel fetch of {len(uncached)} embeddings ({n_workers} workers)"
         )
 
         def fetch_worker():
             import time
 
             start = time.perf_counter()
-            count = 0
-            for chunk_df in self.data.fetch_embeddings_with_connection(
-                bg_connection, uncached
-            ):
-                for _, row in chunk_df.iterrows():
-                    self.state.cached_embeddings[str(row["id"])] = np.array(
-                        row["embedding"]
-                    )
-                    count += 1
+
+            chunk_size = (len(uncached) + n_workers - 1) // n_workers
+            chunks = [
+                uncached[i : i + chunk_size]
+                for i in range(0, len(uncached), chunk_size)
+            ]
+
+            def fetch_chunk(chunk_ids):
+                if not chunk_ids:
+                    return {}
+                conn = self.data.create_background_connection()
+                if conn is None:
+                    return {}
+                result = {}
+                for chunk_df in self.data.fetch_embeddings_with_connection(
+                    conn, chunk_ids
+                ):
+                    for _, row in chunk_df.iterrows():
+                        result[str(row["id"])] = np.array(row["embedding"])
+                conn.close()
+                return result
+
+            total_count = 0
+            with ThreadPoolExecutor(max_workers=n_workers) as executor:
+                futures = [executor.submit(fetch_chunk, chunk) for chunk in chunks]
+                for future in as_completed(futures):
+                    chunk_result = future.result()
+                    self.state.cached_embeddings.update(chunk_result)
+                    total_count += len(chunk_result)
+
             elapsed = (time.perf_counter() - start) * 1000
-            log_to_file(f"prefetch: Completed {count} embeddings in {elapsed:.1f}ms")
-            bg_connection.close()
+            log_to_file(
+                f"prefetch: Completed {total_count} embeddings in {elapsed/1000:.1f}s"
+            )
 
         thread = threading.Thread(target=fetch_worker, daemon=True)
         thread.start()

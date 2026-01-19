@@ -195,3 +195,6 @@ alabama_aquaculture/
 claude_ui_dev/
 optimize_work/
 geometry_cache_work/
+
+# Benchmark scripts
+benchmark_*.py
