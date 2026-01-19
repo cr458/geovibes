@@ -1098,6 +1098,12 @@ class DataManager:
             self._geometry_cache_connection.close()
             self._geometry_cache_connection = None
 
+    def create_background_connection(self) -> Optional[duckdb.DuckDBPyConnection]:
+        """Create a separate connection for background operations."""
+        if not self.current_database_path:
+            return None
+        return self._connect_duckdb(self.current_database_path)
+
     def fetch_embeddings(self, point_ids: List[str], chunk_size: Optional[int] = None):
         if not point_ids:
             return
@@ -1123,7 +1129,7 @@ class DataManager:
             select_clause = ", ".join(select_parts)
             query = f"""
             SELECT {select_clause}
-            FROM geo_embeddings 
+            FROM geo_embeddings
             WHERE id IN ({placeholders})
             """
             log_to_file(
@@ -1132,6 +1138,42 @@ class DataManager:
             arrow_table = self.duckdb_connection.execute(
                 query, prepared_chunk
             ).fetch_arrow_table()
+            chunk_df = arrow_table.to_pandas()
+            yield chunk_df
+
+    def fetch_embeddings_with_connection(
+        self,
+        connection: duckdb.DuckDBPyConnection,
+        point_ids: List[str],
+        chunk_size: Optional[int] = None,
+    ):
+        """Fetch embeddings using a specific connection (for background operations)."""
+        if not point_ids:
+            return
+
+        chunk_size = chunk_size or DatabaseConstants.EMBEDDING_CHUNK_SIZE
+
+        for i in range(0, len(point_ids), chunk_size):
+            chunk = point_ids[i : i + chunk_size]
+            prepared_chunk = prepare_ids_for_query(chunk)
+            placeholders = ",".join(["?" for _ in prepared_chunk])
+            select_parts = ["id"]
+            external_column = getattr(self, "external_id_column", "id")
+            if external_column != "id":
+                select_parts.append(external_column)
+            select_parts.extend(
+                [
+                    "CAST(embedding AS FLOAT[]) as embedding",
+                    "geometry",
+                ]
+            )
+            select_clause = ", ".join(select_parts)
+            query = f"""
+            SELECT {select_clause}
+            FROM geo_embeddings
+            WHERE id IN ({placeholders})
+            """
+            arrow_table = connection.execute(query, prepared_chunk).fetch_arrow_table()
             chunk_df = arrow_table.to_pandas()
             yield chunk_df
 

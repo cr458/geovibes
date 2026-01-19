@@ -1520,6 +1520,11 @@ class GeoVibes:
             log_to_file(f"prefetch: All {len(ids)} embeddings already cached")
             return
 
+        bg_connection = self.data.create_background_connection()
+        if bg_connection is None:
+            log_to_file("prefetch: Could not create background connection")
+            return
+
         log_to_file(
             f"prefetch: Starting background fetch of {len(uncached)} embeddings"
         )
@@ -1529,7 +1534,9 @@ class GeoVibes:
 
             start = time.perf_counter()
             count = 0
-            for chunk_df in self.data.fetch_embeddings(uncached):
+            for chunk_df in self.data.fetch_embeddings_with_connection(
+                bg_connection, uncached
+            ):
                 for _, row in chunk_df.iterrows():
                     self.state.cached_embeddings[str(row["id"])] = np.array(
                         row["embedding"]
@@ -1537,6 +1544,7 @@ class GeoVibes:
                     count += 1
             elapsed = (time.perf_counter() - start) * 1000
             log_to_file(f"prefetch: Completed {count} embeddings in {elapsed:.1f}ms")
+            bg_connection.close()
 
         thread = threading.Thread(target=fetch_worker, daemon=True)
         thread.start()
