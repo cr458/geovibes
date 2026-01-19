@@ -43,6 +43,10 @@ class AppState:
     database_ready: bool = True
     loading_message: str = ""
 
+    # Embedding prefetch state (for deferred search)
+    embeddings_loading: bool = False
+    embeddings_pending_ids: List[str] = field(default_factory=list)
+
     def set_label_mode(self, label: str) -> None:
         """Update the active label mode."""
         self.current_label = label

@@ -1365,3 +1365,142 @@ df = con.execute("""
 """).fetchdf()
 print(f"Row count: {df['cnt'][0]}")  # Should be ~2.18M for Google Satellite
 ```
+
+---
+
+## Phase 4: Parallel Embedding Fetch Optimization (2025-01)
+
+### Problem: Slow Embedding Prefetch for Polygon Labeling
+
+After implementing caching (Phase 3), a new bottleneck emerged: polygon labeling requires fetching embeddings for all points in the polygon. For remote databases, this was taking 90+ seconds for 500 embeddings.
+
+**Root cause analysis:**
+
+FAISS returns IDs ordered by **embedding similarity**, not storage order. This means results are scattered across many row groups. Each row group requires a separate HTTP request (~500ms each).
+
+```
+FAISS search returns: [id_42331, id_891022, id_156, id_2847291, ...]
+                       ↓         ↓          ↓      ↓
+Row groups touched:    [RG_0,    RG_7,      RG_0,  RG_23, ...]
+
+Result: 500 scattered IDs → ~40 row groups → ~40 HTTP requests → 20+ seconds
+```
+
+### Initial Hypothesis: Use DuckDB's Internal Threading
+
+DuckDB documentation suggests setting `threads = 2-5x CPU cores` for httpfs workloads:
+
+> "DuckDB uses synchronous IO when reading remote files. Each thread can make at most one HTTP request at a time."
+
+**Hypothesis**: `SET threads = 50` should parallelize HTTP requests internally.
+
+### Benchmark 1: DuckDB Internal Threads vs ThreadPoolExecutor
+
+**Setup**: 250 scattered embeddings from S3, M1 Mac (10 cores)
+
+| Approach | Configuration | Time |
+|----------|---------------|------|
+| DuckDB `SET threads` | 10 threads | 38.2s |
+| DuckDB `SET threads` | 20 threads | 37.5s |
+| DuckDB `SET threads` | 30 threads | 37.4s |
+| DuckDB `SET threads` | 40 threads | 37.2s |
+| DuckDB `SET threads` | 50 threads | 36.9s |
+| **ThreadPoolExecutor** | 4 workers | 18.1s |
+| **ThreadPoolExecutor** | 8 workers | 15.4s |
+| **ThreadPoolExecutor** | 12 workers | 19.0s |
+| **ThreadPoolExecutor** | 16 workers | **13.5s** |
+| **ThreadPoolExecutor** | 24 workers | 21.0s |
+
+**Surprising finding**: DuckDB's internal threading barely helped (38s → 37s), while ThreadPoolExecutor achieved **2.7x speedup** (37s → 13.5s).
+
+**Why?** DuckDB threads share a single HTTP session. Multiple connections = multiple independent HTTP sessions = true parallelism.
+
+### Key Insight: Row-Group-Aware Batching
+
+**Hypothesis**: If we group IDs by row group before fetching, each batch reads from exactly one row group, minimizing redundant HTTP requests.
+
+```python
+ROW_GROUP_SIZE = 122880  # DuckDB default
+
+# Group IDs by row group
+rg_groups = defaultdict(list)
+for id_ in ids:
+    rg_groups[id_ // ROW_GROUP_SIZE].append(id_)
+
+# Fetch each row group's IDs together
+batches = list(rg_groups.values())
+```
+
+### Benchmark 2: Naive Chunking vs Row-Group Batching
+
+**Setup**: 500 scattered embeddings, 16 parallel workers
+
+| Approach | Batches | Time |
+|----------|---------|------|
+| Naive chunking (split by count) | 16 chunks | 8.0s |
+| **Row-group batching** | 3 batches | **3.0s** |
+
+**Result**: Row-group batching is **2.6x faster**.
+
+### Benchmark 3: Scaling Analysis
+
+**Question**: Do row-group batches become too large with more samples?
+
+| N Samples | Row Groups Touched | Max Batch Size | Avg Batch Size |
+|-----------|-------------------|----------------|----------------|
+| 100 | 37 | 6 | 2.7 |
+| 250 | 44 | 10 | 5.7 |
+| 500 | 44 | 19 | 11.4 |
+| 1,000 | 44 | 34 | 22.7 |
+| 2,000 | 44 | 65 | 45.5 |
+| 5,000 | 44 | 139 | 113.6 |
+| 10,000 | 44 | 261 | 227.3 |
+
+**Finding**: Scaling is excellent. Even with 10,000 samples:
+- Only 44 row groups (bounded by database structure)
+- Max batch size is 261 IDs (SQL handles 32k+ parameters easily)
+- Memory usage ~15MB (fine)
+
+### Combined Optimization Impact
+
+| Approach | Time (500 embeddings) | Speedup |
+|----------|----------------------|---------|
+| Sequential (baseline) | ~93s | 1x |
+| + ThreadPoolExecutor (16 workers) | ~27s | 3.4x |
+| + Row-group batching | ~10s | **9.3x** |
+
+### Implementation
+
+Updated `_prefetch_embeddings_async()` in `geovibes/ui/app.py`:
+
+```python
+def _prefetch_embeddings_async(self, ids: list, n_workers: int = 16) -> None:
+    """Pre-fetch embeddings using row-group-aware parallel batching."""
+    ROW_GROUP_SIZE = 122880  # DuckDB default
+
+    # Group IDs by row group for optimal httpfs performance
+    rg_groups = defaultdict(list)
+    for id_ in uncached:
+        rg_groups[id_ // ROW_GROUP_SIZE].append(id_)
+    batches = list(rg_groups.values())
+
+    actual_workers = min(n_workers, len(batches), 32)
+
+    with ThreadPoolExecutor(max_workers=actual_workers) as executor:
+        futures = [executor.submit(fetch_batch, batch) for batch in batches]
+        # ... fetch each batch with separate connection
+```
+
+### Key Learnings
+
+1. **DuckDB `SET threads` doesn't help for httpfs** - Threads share one HTTP session
+2. **Multiple connections = true parallelism** - Each connection has its own HTTP session
+3. **Row-group batching is critical** - Grouping by `id // 122880` reduces redundant reads
+4. **Optimal workers ≈ 16** - Beyond that, overhead increases without benefit
+5. **Scaling is safe** - Row groups are bounded by database structure (~44 for 5.3M rows)
+
+### Visualization
+
+See `blog_figures/embedding_fetch_optimization.png` for benchmark visualization.
+
+![Embedding Fetch Optimization](../blog_figures/embedding_fetch_optimization.png)
