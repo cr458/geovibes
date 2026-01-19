@@ -1233,14 +1233,22 @@ class GeoVibes:
 
             if not point_ids:
                 polygon_wkt = polygon.wkt
-                query = f"""
-                SELECT id
-                FROM geo_embeddings
-                WHERE ST_Within(geometry, ST_GeomFromText('{polygon_wkt}'))
-                """
-                arrow_table = self.data.duckdb_connection.execute(
-                    query
-                ).fetch_arrow_table()
+                # Use local geometry cache if available (fast), otherwise remote
+                if self.data._geometry_cache_connection is not None:
+                    query = f"""
+                    SELECT id
+                    FROM geometry_cache
+                    WHERE ST_Within(geometry, ST_GeomFromText('{polygon_wkt}'))
+                    """
+                    conn = self.data._geometry_cache_connection
+                else:
+                    query = f"""
+                    SELECT id
+                    FROM geo_embeddings
+                    WHERE ST_Within(geometry, ST_GeomFromText('{polygon_wkt}'))
+                    """
+                    conn = self.data.duckdb_connection
+                arrow_table = conn.execute(query).fetch_arrow_table()
                 point_ids.extend(arrow_table.to_pandas()["id"].astype(str).tolist())
 
             if not point_ids:
@@ -1683,12 +1691,23 @@ class GeoVibes:
             return self._empty_collection()
         prepared_ids = [str(pid) for pid in ids]
         placeholders = ",".join(["?" for _ in prepared_ids])
-        query = f"""
-        SELECT ST_AsGeoJSON(geometry) as geometry
-        FROM geo_embeddings
-        WHERE id IN ({placeholders})
-        """
-        df = self.data.duckdb_connection.execute(query, prepared_ids).df()
+
+        # Use local geometry cache if available (fast), otherwise fall back to remote
+        if self.data._geometry_cache_connection is not None:
+            query = f"""
+            SELECT ST_AsGeoJSON(geometry) as geometry
+            FROM geometry_cache
+            WHERE id IN ({placeholders})
+            """
+            df = self.data._geometry_cache_connection.execute(query, prepared_ids).df()
+        else:
+            query = f"""
+            SELECT ST_AsGeoJSON(geometry) as geometry
+            FROM geo_embeddings
+            WHERE id IN ({placeholders})
+            """
+            df = self.data.duckdb_connection.execute(query, prepared_ids).df()
+
         features = [
             {
                 "type": "Feature",
