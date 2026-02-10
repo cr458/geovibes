@@ -1587,7 +1587,6 @@ dependencies = [
     { name = "duckdb" },
     { name = "earthengine-api" },
     { name = "faiss-cpu" },
-    { name = "fiona" },
     { name = "flake8" },
     { name = "gcsfs" },
     { name = "geemap" },
@@ -1614,7 +1613,6 @@ dependencies = [
     { name = "pytest-cov" },
     { name = "python-dotenv" },
     { name = "pyyaml" },
-    { name = "rasterio" },
     { name = "ruff" },
     { name = "s3fs" },
     { name = "scikit-learn" },
@@ -1625,6 +1623,12 @@ dependencies = [
     { name = "xgboost" },
 ]
 
+[package.optional-dependencies]
+geoio = [
+    { name = "fiona" },
+    { name = "rasterio" },
+]
+
 [package.metadata]
 requires-dist = [
     { name = "black" },
@@ -1632,7 +1636,7 @@ requires-dist = [
     { name = "duckdb", specifier = ">1.0.0" },
     { name = "earthengine-api" },
     { name = "faiss-cpu" },
-    { name = "fiona" },
+    { name = "fiona", marker = "extra == 'geoio'" },
     { name = "flake8" },
     { name = "gcsfs" },
     { name = "geemap" },
@@ -1657,7 +1661,7 @@ requires-dist = [
     { name = "pytest-cov" },
     { name = "python-dotenv" },
     { name = "pyyaml" },
-    { name = "rasterio" },
+    { name = "rasterio", marker = "extra == 'geoio'" },
     { name = "ruff" },
     { name = "s3fs" },
     { name = "scikit-learn" },
@@ -1667,6 +1671,7 @@ requires-dist = [
     { name = "voila" },
     { name = "xgboost", specifier = ">=2.0.0" },
 ]
+provides-extras = ["geoio"]
 
 [[package]]
 name = "google-api-core"

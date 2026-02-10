@@ -230,3 +230,198 @@ class TestDataManagerRemoteMode:
         assert dm.faiss_index.ntotal == 10
 
         dm.close()
+
+
+class TestPrefetchGrouping:
+    """Tests for row-group-aware prefetch batching."""
+
+    def test_group_ids_for_prefetch_falls_back_to_id_div(self):
+        """Should group IDs with id//row_group when no row-group cache is loaded."""
+        from geovibes.ui.data_manager import DataManager
+
+        dm = DataManager.__new__(DataManager)
+        dm._row_group_cache_connection = None
+        dm._row_group_size = 100
+
+        batches, mode, lookup_ms = dm.group_ids_for_prefetch([1, 2, 150, 199, 205])
+
+        assert mode == "id_div"
+        assert lookup_ms == 0.0
+        normalized = sorted(sorted(batch) for batch in batches)
+        assert normalized == [[1, 2], [150, 199], [205]]
+
+    def test_group_ids_for_prefetch_uses_row_group_cache(self):
+        """Should use cached physical row-group mapping when available."""
+        from geovibes.ui.data_manager import DataManager
+
+        dm = DataManager.__new__(DataManager)
+        dm._row_group_size = 100
+        dm._row_group_cache_connection = duckdb.connect(":memory:")
+        dm._row_group_cache_connection.execute(
+            "CREATE TABLE row_group_cache (id BIGINT, row_group BIGINT)"
+        )
+        dm._row_group_cache_connection.executemany(
+            "INSERT INTO row_group_cache VALUES (?, ?)",
+            [(1, 4), (2, 4), (205, 9)],
+        )
+
+        batches, mode, lookup_ms = dm.group_ids_for_prefetch([205, 1, 2, 350])
+        dm._row_group_cache_connection.close()
+
+        assert mode == "row_group_cache"
+        assert lookup_ms >= 0.0
+        normalized = sorted(sorted(batch) for batch in batches)
+        # 350 is absent from cache and should fall back to id//100 => group 3.
+        assert normalized == [[1, 2], [205], [350]]
+
+    def test_group_ids_for_prefetch_applies_id_ascending_scheduler(self):
+        """Batches should be returned in ascending ID order by default scheduler."""
+        from geovibes.ui.data_manager import DataManager
+
+        dm = DataManager.__new__(DataManager)
+        dm._row_group_cache_connection = None
+        dm._row_group_size = 100
+        dm._prefetch_batch_scheduler = "id_ascending"
+
+        batches, mode, _ = dm.group_ids_for_prefetch([205, 150, 2, 1])
+
+        assert mode == "id_div"
+        assert batches == [[1, 2], [150], [205]]
+
+
+class TestQueryModes:
+    """Tests for metadata and prefetch query mode toggles."""
+
+    def test_query_search_metadata_values_join_uses_geometry_cache(self):
+        from geovibes.ui.data_manager import DataManager
+
+        dm = DataManager.__new__(DataManager)
+        dm.external_id_column = "id"
+        dm._metadata_query_mode = "values_join"
+        dm._geometry_cache_connection = duckdb.connect(":memory:")
+        dm._geometry_cache_connection.execute("INSTALL spatial; LOAD spatial;")
+        dm._geometry_cache_connection.execute(
+            """
+            CREATE TABLE geometry_cache AS
+            SELECT
+                1::BIGINT AS id,
+                ST_GeomFromText('POINT(-86.50 32.50)') AS geometry
+            UNION ALL
+            SELECT
+                3::BIGINT AS id,
+                ST_GeomFromText('POINT(-86.30 32.60)') AS geometry
+            """
+        )
+
+        df = dm.query_search_metadata([3, 1])
+        dm._geometry_cache_connection.close()
+
+        assert set(df["id"].astype(int).tolist()) == {1, 3}
+        assert "geometry_json" in df.columns
+        assert "geometry_wkt" in df.columns
+
+    def test_fetch_embedding_map_with_connection_values_join(self):
+        from geovibes.ui.data_manager import DataManager
+
+        conn = duckdb.connect(":memory:")
+        conn.execute(
+            """
+            CREATE TABLE geo_embeddings (
+                id BIGINT PRIMARY KEY,
+                embedding FLOAT[4]
+            )
+            """
+        )
+        conn.execute("INSERT INTO geo_embeddings VALUES (1, [1.0, 2.0, 3.0, 4.0])")
+        conn.execute("INSERT INTO geo_embeddings VALUES (3, [3.0, 4.0, 5.0, 6.0])")
+
+        dm = DataManager.__new__(DataManager)
+        dm._prefetch_query_mode = "values_join"
+
+        out = dm.fetch_embedding_map_with_connection(conn, ["3", "1"])
+        conn.close()
+
+        assert set(out.keys()) == {"1", "3"}
+        assert out["1"].shape == (4,)
+        assert out["3"].dtype == np.float32
+
+    def test_resolve_embedding_select_expr_prefers_native_fixed_array(self, monkeypatch):
+        from geovibes.ui.data_manager import DataManager
+
+        dm = DataManager.__new__(DataManager)
+        dm.embedding_type = "FLOAT[384]"
+        monkeypatch.delenv("GEOVIBES_EMBEDDING_SELECT_EXPR", raising=False)
+
+        expr = dm._resolve_embedding_select_expr()
+
+        assert expr == "embedding"
+
+    def test_resolve_embedding_select_expr_honors_env_override(self, monkeypatch):
+        from geovibes.ui.data_manager import DataManager
+
+        dm = DataManager.__new__(DataManager)
+        dm.embedding_type = "FLOAT[384]"
+        monkeypatch.setenv("GEOVIBES_EMBEDDING_SELECT_EXPR", "CAST(embedding AS FLOAT[])")
+
+        expr = dm._resolve_embedding_select_expr()
+
+        assert expr == "CAST(embedding AS FLOAT[])"
+
+
+class TestBackgroundConnectionPool:
+    """Tests for persistent background connection pooling."""
+
+    class _DummyConn:
+        def __init__(self, name):
+            self.name = name
+            self.closed = False
+
+        def execute(self, _query):
+            return self
+
+        def close(self):
+            self.closed = True
+
+    def test_background_pool_reuses_connections(self):
+        from geovibes.ui.data_manager import DataManager
+
+        dm = DataManager.__new__(DataManager)
+        dm.verbose = False
+        dm.current_database_path = "s3://bucket/path/metadata.db"
+        created = []
+
+        def fake_connect(_path):
+            conn = self._DummyConn(f"conn-{len(created)}")
+            created.append(conn)
+            return conn
+
+        dm._connect_duckdb = fake_connect
+
+        dm.configure_background_connection_pool(2)
+        c1 = dm.acquire_background_connection()
+        c2 = dm.acquire_background_connection()
+        assert len(created) == 2
+
+        dm.release_background_connection(c1)
+        dm.release_background_connection(c2)
+
+        stats = dm.background_pool_stats()
+        assert stats["size"] == 2
+        assert stats["idle"] == 2
+
+        c3 = dm.acquire_background_connection()
+        dm.release_background_connection(c3)
+        dm._close_background_connection_pool()
+
+        assert all(conn.closed for conn in created)
+
+    def test_background_pool_disabled_for_local_database(self):
+        from geovibes.ui.data_manager import DataManager
+
+        dm = DataManager.__new__(DataManager)
+        dm.verbose = False
+        dm.current_database_path = "/tmp/local.db"
+
+        dm.configure_background_connection_pool(4)
+        stats = dm.background_pool_stats()
+        assert stats["size"] == 0

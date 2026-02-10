@@ -1,0 +1,54 @@
+source:
+  faiss_url: s3://us-west-2.opendata.source.coop/geovibes/search/USA/alabama/2024-01-01-2025-01-01/httpfs/alabama_dino_vit_small_patch16_224_2024_2025_32_16_10/faiss.index
+  db_variants:
+  - name: baseline
+    db_url: s3://us-west-2.opendata.source.coop/geovibes/search/USA/alabama/2024-01-01-2025-01-01/httpfs/alabama_dino_vit_small_patch16_224_2024_2025_32_16_10/metadata.db
+    geometry_cache_url: s3://us-west-2.opendata.source.coop/geovibes/search/USA/alabama/2024-01-01-2025-01-01/httpfs/alabama_dino_vit_small_patch16_224_2024_2025_32_16_10/geometry_cache.parquet
+  query_ids:
+  - 2660000
+  - 1000000
+  - 4000000
+  query_id_triplets:
+  - - 78824
+    - 1033427
+    - 4970394
+  - - 592921
+    - 215330
+    - 4384211
+  - - 1686758
+    - 2662800
+    - 5070803
+  label_clicks:
+  - lon: -86.55
+    lat: 32.35
+  - lon: -86.3
+    lat: 32.55
+workload:
+  n_trials: 3
+  n_neighbors_values:
+  - 500
+  prefetch_top_k: 1000
+  prefetch_fast_k: 100
+  nprobe: 1024
+  row_group_size: 122880
+  pool_scope: trial
+  run_order: trial_major
+  run_seed: 20260210
+  capture_faiss_ids: true
+  run_label_queries: false
+  prefetch_user_consumed_k: 100
+  embedding_lru_size: 500
+  embedding_cache_scope: run
+  runtime_settings:
+    enable_object_cache: false
+    extra_sql: []
+strategies:
+- name: cache_lru_500
+  metadata_source: geometry_cache
+  prefetch_method: rowgroup_cache_threadpool_reuse_conn
+  n_workers: 16
+  use_connection_pool: true
+  fetch_mode: fetchall
+  prefetch_top_k: 1000
+output:
+  directory: results

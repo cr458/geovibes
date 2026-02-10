@@ -3,14 +3,19 @@
 from __future__ import annotations
 
 import csv
+import hashlib
 import os
 import pathlib
+import queue
 import re
+import threading
+from collections import defaultdict
 from typing import Any, Dict, List, Optional, Tuple
 
 import duckdb
 import faiss
 import geopandas as gpd
+import numpy as np
 
 from geovibes.database.faiss_cache import FaissCache
 from geovibes.ee_tools import initialize_ee_with_credentials
@@ -41,6 +46,34 @@ class DataManager:
         if not path:
             return False
         return path.startswith("s3://") or path.startswith("gs://")
+
+    @staticmethod
+    def _normalize_query_mode(raw: Optional[str]) -> str:
+        mode = (raw or "in_list").strip().lower()
+        if mode in {"values", "values_join"}:
+            return "values_join"
+        return "in_list"
+
+    @staticmethod
+    def _normalize_batch_scheduler(raw: Optional[str]) -> str:
+        mode = (raw or "id_ascending").strip().lower()
+        if mode in {"none", "as_is"}:
+            return "as_is"
+        if mode in {"id_ascending", "ascending", "asc"}:
+            return "id_ascending"
+        if mode in {"id_descending", "descending", "desc"}:
+            return "id_descending"
+        return "id_ascending"
+
+    @staticmethod
+    def _coerce_id_list(ids: List[object]) -> List[object]:
+        coerced: List[object] = []
+        for value in ids:
+            try:
+                coerced.append(int(value))  # type: ignore[arg-type]
+            except Exception:
+                coerced.append(str(value))
+        return coerced
 
     def __init__(
         self,
@@ -132,8 +165,30 @@ class DataManager:
         self._owns_connection = False
         self.faiss_index: Optional[faiss.Index] = None
         self.embedding_dim: Optional[int] = None
+        self.embedding_type: Optional[str] = None
+        self._embedding_select_expr: str = os.getenv(
+            "GEOVIBES_EMBEDDING_SELECT_EXPR", "embedding"
+        )
         self._geometry_cache_local_path: Optional[pathlib.Path] = None
         self._geometry_cache_connection: Optional[duckdb.DuckDBPyConnection] = None
+        self._row_group_cache_local_path: Optional[pathlib.Path] = None
+        self._row_group_cache_connection: Optional[duckdb.DuckDBPyConnection] = None
+        self._row_group_size: int = 122880
+        self._background_pool_size: int = 0
+        self._background_pool_created: int = 0
+        self._background_pool_queue: Optional[
+            queue.LifoQueue[duckdb.DuckDBPyConnection]
+        ] = None
+        self._background_pool_lock = threading.Lock()
+        self._metadata_query_mode = self._normalize_query_mode(
+            os.getenv("GEOVIBES_METADATA_QUERY_MODE", "values_join")
+        )
+        self._prefetch_query_mode = self._normalize_query_mode(
+            os.getenv("GEOVIBES_PREFETCH_QUERY_MODE", "in_list")
+        )
+        self._prefetch_batch_scheduler = self._normalize_batch_scheduler(
+            os.getenv("GEOVIBES_PREFETCH_BATCH_SCHEDULER", "id_ascending")
+        )
         self.center_x: float = 0.0
         self.center_y: float = 0.0
 
@@ -165,6 +220,13 @@ class DataManager:
         duckdb_connection: Optional[duckdb.DuckDBPyConnection] = None,
     ) -> None:
         """Internal method to connect to a database."""
+        if getattr(self, "_owns_connection", False) and getattr(
+            self, "duckdb_connection", None
+        ):
+            self.duckdb_connection.close()
+
+        self._close_auxiliary_connections()
+
         self.current_database_info = db_info
         self.current_database_path = db_info["db_path"]
         self.current_faiss_path = db_info.get("faiss_path")
@@ -196,15 +258,19 @@ class DataManager:
 
         # Detect embedding dimension
         self.embedding_dim = self._detect_embedding_dim()
+        self.embedding_type = self._detect_embedding_type()
+        self._embedding_select_expr = self._resolve_embedding_select_expr()
 
         # Load geometry cache for remote databases
         self.current_geometry_cache_path = db_info.get("geometry_cache_path")
-        self._geometry_cache_local_path = None
-        self._geometry_cache_connection = None
+        self._row_group_cache_local_path = None
         if self.current_geometry_cache_path and self.is_remote_url(
             self.current_database_path
         ):
             self._load_geometry_cache(self.current_geometry_cache_path)
+
+        if self.is_remote_url(self.current_database_path):
+            self._load_row_group_cache(self._row_group_size)
 
         # Warm up remote databases to preload row groups
         if self.is_remote_url(self.current_database_path):
@@ -847,17 +913,7 @@ class DataManager:
             raise RuntimeError(f"Failed to connect to local database: {exc}")
 
     def _apply_duckdb_settings(self, database_path: Optional[str]) -> None:
-        for query in DatabaseConstants.get_memory_setup_queries():
-            self.duckdb_connection.execute(query)
-        try:
-            self.duckdb_connection.execute("SET enable_progress_bar=false")
-            self.duckdb_connection.execute("SET enable_profiling='no_output'")
-            self.duckdb_connection.execute("PRAGMA disable_profiling")
-            self.duckdb_connection.execute("SET enable_object_cache=false")
-            if self.verbose:
-                print("✅ Progress bar and profiling disabled")
-        except Exception:  # pragma: no cover - optional settings
-            pass
+        self._apply_connection_runtime_settings(self.duckdb_connection)
 
         if database_path:
             extension_queries = DatabaseConstants.get_extension_setup_queries(
@@ -873,6 +929,23 @@ class DataManager:
                             print("🗺️  spatial extension loaded for geometry support")
                 except Exception as exc:
                     raise RuntimeError(f"Failed to load required extension: {exc}")
+
+    def _apply_connection_runtime_settings(
+        self, connection: Optional[duckdb.DuckDBPyConnection]
+    ) -> None:
+        if connection is None:
+            return
+        for query in DatabaseConstants.get_memory_setup_queries():
+            connection.execute(query)
+        try:
+            connection.execute("SET enable_progress_bar=false")
+            connection.execute("SET enable_profiling='no_output'")
+            connection.execute("PRAGMA disable_profiling")
+            connection.execute("SET enable_object_cache=false")
+            if self.verbose:
+                print("✅ Progress bar and profiling disabled")
+        except Exception:  # pragma: no cover - optional settings
+            pass
 
     def _refresh_id_columns(self) -> None:
         columns = self._detect_id_columns()
@@ -909,6 +982,31 @@ class DataManager:
                 print(f"⚠️ Could not detect embedding dimension: {exc}")
                 print("⚠️ Using default dimension of 384")
             return 384
+
+    def _detect_embedding_type(self) -> str:
+        try:
+            row = self.duckdb_connection.execute(
+                "SELECT typeof(embedding) FROM geo_embeddings LIMIT 1"
+            ).fetchone()
+            if row and row[0]:
+                emb_type = str(row[0])
+                if self.verbose:
+                    print(f"🔍 Detected embedding type: {emb_type}")
+                return emb_type
+        except Exception:
+            pass
+        return "FLOAT[]"
+
+    def _resolve_embedding_select_expr(self) -> str:
+        env_expr = os.getenv("GEOVIBES_EMBEDDING_SELECT_EXPR")
+        if env_expr and env_expr.strip():
+            return env_expr.strip()
+
+        emb_type = (self.embedding_type or "").upper()
+        # Fixed-size arrays/lists can be converted to float32 in Python without SQL casts.
+        if "[" in emb_type:
+            return "embedding"
+        return "CAST(embedding AS FLOAT[])"
 
     def _warm_up_remote_database(self) -> None:
         """Warm up remote database by preloading row groups.
@@ -1084,27 +1182,312 @@ class DataManager:
         if self.verbose:
             print(f"✅ Geometry cache ready ({row_count:,} geometries)")
 
+    def _close_auxiliary_connections(self) -> None:
+        self._close_background_connection_pool()
+
+        if getattr(self, "_geometry_cache_connection", None):
+            try:
+                self._geometry_cache_connection.close()
+            except Exception:
+                pass
+        self._geometry_cache_connection = None
+        self._geometry_cache_local_path = None
+
+        if getattr(self, "_row_group_cache_connection", None):
+            try:
+                self._row_group_cache_connection.close()
+            except Exception:
+                pass
+        self._row_group_cache_connection = None
+        self._row_group_cache_local_path = None
+
+    def _row_group_cache_path(
+        self, database_path: str, row_group_size: int
+    ) -> pathlib.Path:
+        cache_dir = pathlib.Path.home() / ".cache" / "geovibes" / "row_groups"
+        cache_dir.mkdir(parents=True, exist_ok=True)
+        cache_key = hashlib.sha256(
+            f"{database_path}|{int(row_group_size)}".encode("utf-8")
+        ).hexdigest()[:16]
+        return cache_dir / f"{cache_key}.parquet"
+
+    def _load_row_group_cache(self, row_group_size: int = 122880) -> None:
+        """Create/load local id->row_group cache for remote prefetch batching."""
+        if not self.current_database_path or not self.is_remote_url(
+            self.current_database_path
+        ):
+            return
+        if self.duckdb_connection is None:
+            return
+
+        cache_path = self._row_group_cache_path(self.current_database_path, row_group_size)
+        if not cache_path.exists():
+            if self.verbose:
+                print("📦 Building row-group cache for remote prefetch...")
+            self.duckdb_connection.execute(
+                f"""
+                COPY (
+                    SELECT id, CAST(FLOOR(rowid / {int(row_group_size)}) AS BIGINT) AS row_group
+                    FROM remote_db.geo_embeddings
+                )
+                TO '{cache_path}' (FORMAT PARQUET, COMPRESSION ZSTD)
+                """
+            )
+
+        self._row_group_cache_connection = duckdb.connect(":memory:")
+        self._row_group_cache_connection.execute(
+            f"CREATE VIEW row_group_cache AS SELECT * FROM '{cache_path}'"
+        )
+        self._row_group_cache_local_path = cache_path
+        self._row_group_size = int(row_group_size)
+
+        if self.verbose:
+            rows = self._row_group_cache_connection.execute(
+                "SELECT COUNT(*) FROM row_group_cache"
+            ).fetchone()[0]
+            print(f"✅ Row-group cache ready ({rows:,} ids)")
+
+    def _close_background_connection_pool(self) -> None:
+        self._ensure_background_pool_state()
+
+        with self._background_pool_lock:
+            pool = self._background_pool_queue
+            self._background_pool_queue = None
+            self._background_pool_size = 0
+            self._background_pool_created = 0
+
+        if pool is None:
+            return
+
+        while True:
+            try:
+                conn = pool.get_nowait()
+            except queue.Empty:
+                break
+            try:
+                conn.close()
+            except Exception:
+                pass
+
+    def _ensure_background_pool_state(self) -> None:
+        if not hasattr(self, "_background_pool_lock"):
+            self._background_pool_lock = threading.Lock()
+        if not hasattr(self, "_background_pool_queue"):
+            self._background_pool_queue = None
+        if not hasattr(self, "_background_pool_size"):
+            self._background_pool_size = 0
+        if not hasattr(self, "_background_pool_created"):
+            self._background_pool_created = 0
+
+    def configure_background_connection_pool(self, max_connections: int) -> None:
+        """Configure persistent pool for remote background embedding fetches."""
+        self._ensure_background_pool_state()
+
+        target_size = max(0, int(max_connections))
+
+        if (
+            target_size == 0
+            or not self.current_database_path
+            or not self.is_remote_url(self.current_database_path)
+        ):
+            self._close_background_connection_pool()
+            return
+
+        with self._background_pool_lock:
+            if (
+                self._background_pool_queue is not None
+                and self._background_pool_size == target_size
+            ):
+                return
+
+        self._close_background_connection_pool()
+        with self._background_pool_lock:
+            self._background_pool_queue = queue.LifoQueue(maxsize=target_size)
+            self._background_pool_size = target_size
+            self._background_pool_created = 0
+
+    def acquire_background_connection(
+        self, timeout_seconds: float = 30.0
+    ) -> Optional[duckdb.DuckDBPyConnection]:
+        """Acquire pooled background connection (or create one if pool disabled)."""
+        self._ensure_background_pool_state()
+
+        with self._background_pool_lock:
+            pool = self._background_pool_queue
+            pool_size = self._background_pool_size
+            if pool is None or pool_size <= 0:
+                return self.create_background_connection()
+
+            if self._background_pool_created < pool_size:
+                self._background_pool_created += 1
+                should_create = True
+            else:
+                should_create = False
+
+        if should_create:
+            conn = self.create_background_connection()
+            if conn is None:
+                with self._background_pool_lock:
+                    self._background_pool_created = max(
+                        0, self._background_pool_created - 1
+                    )
+            return conn
+
+        try:
+            return pool.get(timeout=max(0.01, float(timeout_seconds)))
+        except queue.Empty:
+            if self.verbose:
+                print("⚠️ Background pool timeout; creating transient connection")
+            return self.create_background_connection()
+
+    def release_background_connection(
+        self, connection: Optional[duckdb.DuckDBPyConnection]
+    ) -> None:
+        """Return a background connection to pool (or close if not pooled)."""
+        self._ensure_background_pool_state()
+
+        if connection is None:
+            return
+
+        with self._background_pool_lock:
+            pool = self._background_pool_queue
+            pool_size = self._background_pool_size
+
+        if pool is None or pool_size <= 0:
+            try:
+                connection.close()
+            except Exception:
+                pass
+            return
+
+        try:
+            pool.put_nowait(connection)
+        except queue.Full:
+            # Connection is transient or pool was resized.
+            try:
+                connection.close()
+            except Exception:
+                pass
+
+    def background_pool_stats(self) -> Dict[str, int]:
+        self._ensure_background_pool_state()
+
+        with self._background_pool_lock:
+            size = self._background_pool_size
+            created = self._background_pool_created
+            idle = self._background_pool_queue.qsize() if self._background_pool_queue else 0
+        return {"size": size, "created": created, "idle": idle}
+
     # ------------------------------------------------------------------
     # Public API
     # ------------------------------------------------------------------
 
     def close(self) -> None:
+        self._close_auxiliary_connections()
         if getattr(self, "_owns_connection", False):
             if getattr(self, "duckdb_connection", None):
                 self.duckdb_connection.close()
                 if self.verbose:
                     print("🔌 DuckDB connection closed.")
-        if getattr(self, "_geometry_cache_connection", None):
-            self._geometry_cache_connection.close()
-            self._geometry_cache_connection = None
 
     def create_background_connection(self) -> Optional[duckdb.DuckDBPyConnection]:
         """Create a separate connection for background operations."""
         if not self.current_database_path:
             return None
-        return self._connect_duckdb(self.current_database_path)
+        connection = self._connect_duckdb(self.current_database_path)
+        self._apply_connection_runtime_settings(connection)
+        return connection
 
-    def fetch_embeddings(self, point_ids: List[str], chunk_size: Optional[int] = None):
+    def _build_id_predicate(
+        self,
+        ids: List[object],
+        *,
+        query_mode: str,
+        target_alias: str = "",
+        id_column: str = "id",
+    ) -> tuple[str, List[object]]:
+        """Build an ID predicate SQL fragment and parameters."""
+        normalized_mode = self._normalize_query_mode(query_mode)
+        prefix = f"{target_alias}." if target_alias else ""
+        if normalized_mode == "values_join":
+            values_rows = ",".join(["(?)" for _ in ids])
+            clause = (
+                f"{prefix}{id_column} IN ("
+                f"SELECT CAST(v.id AS BIGINT) FROM (VALUES {values_rows}) AS v(id)"
+                ")"
+            )
+            return clause, ids
+
+        placeholders = ",".join(["?" for _ in ids])
+        clause = f"{prefix}{id_column} IN ({placeholders})"
+        return clause, ids
+
+    def group_ids_for_prefetch(
+        self, ids: List[int], row_group_size: Optional[int] = None
+    ) -> Tuple[List[List[int]], str, float]:
+        """Group IDs for remote embedding prefetch.
+
+        Uses local row-group cache when available (robust to table reordering),
+        otherwise falls back to id//row_group_size grouping.
+        """
+        if not ids:
+            return [], "none", 0.0
+
+        int_ids = [int(id_) for id_ in ids]
+        effective_row_group = int(row_group_size or self._row_group_size)
+
+        if self._row_group_cache_connection is not None:
+            import time
+
+            placeholders = ",".join(["?" for _ in int_ids])
+            start = time.perf_counter()
+            df = self._row_group_cache_connection.execute(
+                f"SELECT id, row_group FROM row_group_cache WHERE id IN ({placeholders})",
+                int_ids,
+            ).fetchdf()
+            lookup_ms = (time.perf_counter() - start) * 1000.0
+
+            groups: dict[int, list[int]] = defaultdict(list)
+            found = set()
+            for _, row in df.iterrows():
+                id_val = int(row["id"])
+                groups[int(row["row_group"])].append(id_val)
+                found.add(id_val)
+
+            # Defensive fallback if cache misses IDs.
+            for id_val in int_ids:
+                if id_val not in found:
+                    groups[id_val // effective_row_group].append(id_val)
+
+            batches = [sorted(batch) for batch in groups.values() if batch]
+            scheduler = self._normalize_batch_scheduler(
+                getattr(self, "_prefetch_batch_scheduler", "id_ascending")
+            )
+            if scheduler == "id_ascending":
+                batches.sort(key=lambda batch: batch[0])
+            elif scheduler == "id_descending":
+                batches.sort(key=lambda batch: batch[0], reverse=True)
+            return batches, "row_group_cache", lookup_ms
+
+        groups = defaultdict(list)
+        for id_val in int_ids:
+            groups[id_val // effective_row_group].append(id_val)
+        batches = [sorted(batch) for batch in groups.values() if batch]
+        scheduler = self._normalize_batch_scheduler(
+            getattr(self, "_prefetch_batch_scheduler", "id_ascending")
+        )
+        if scheduler == "id_ascending":
+            batches.sort(key=lambda batch: batch[0])
+        elif scheduler == "id_descending":
+            batches.sort(key=lambda batch: batch[0], reverse=True)
+        return batches, "id_div", 0.0
+
+    def fetch_embeddings(
+        self,
+        point_ids: List[str],
+        chunk_size: Optional[int] = None,
+        include_geometry: bool = True,
+    ):
         if not point_ids:
             return
 
@@ -1120,12 +1503,10 @@ class DataManager:
             external_column = getattr(self, "external_id_column", "id")
             if external_column != "id":
                 select_parts.append(external_column)
-            select_parts.extend(
-                [
-                    "CAST(embedding AS FLOAT[]) as embedding",
-                    "geometry",
-                ]
-            )
+            select_expr = getattr(self, "_embedding_select_expr", "embedding")
+            select_parts.append(f"{select_expr} as embedding")
+            if include_geometry:
+                select_parts.append("geometry")
             select_clause = ", ".join(select_parts)
             query = f"""
             SELECT {select_clause}
@@ -1146,6 +1527,7 @@ class DataManager:
         connection: duckdb.DuckDBPyConnection,
         point_ids: List[str],
         chunk_size: Optional[int] = None,
+        include_geometry: bool = True,
     ):
         """Fetch embeddings using a specific connection (for background operations)."""
         if not point_ids:
@@ -1161,12 +1543,10 @@ class DataManager:
             external_column = getattr(self, "external_id_column", "id")
             if external_column != "id":
                 select_parts.append(external_column)
-            select_parts.extend(
-                [
-                    "CAST(embedding AS FLOAT[]) as embedding",
-                    "geometry",
-                ]
-            )
+            select_expr = getattr(self, "_embedding_select_expr", "embedding")
+            select_parts.append(f"{select_expr} as embedding")
+            if include_geometry:
+                select_parts.append("geometry")
             select_clause = ", ".join(select_parts)
             query = f"""
             SELECT {select_clause}
@@ -1176,6 +1556,55 @@ class DataManager:
             arrow_table = connection.execute(query, prepared_chunk).fetch_arrow_table()
             chunk_df = arrow_table.to_pandas()
             yield chunk_df
+
+    def fetch_embedding_map(
+        self, point_ids: List[str], chunk_size: Optional[int] = None
+    ) -> Dict[str, np.ndarray]:
+        """Fetch embeddings into an id->np.ndarray map using the primary connection."""
+        if self.duckdb_connection is None:
+            return {}
+        return self.fetch_embedding_map_with_connection(
+            self.duckdb_connection,
+            point_ids,
+            chunk_size=chunk_size,
+        )
+
+    def fetch_embedding_map_with_connection(
+        self,
+        connection: duckdb.DuckDBPyConnection,
+        point_ids: List[str],
+        chunk_size: Optional[int] = None,
+        query_mode: Optional[str] = None,
+    ) -> Dict[str, np.ndarray]:
+        """Fetch embeddings into an id->np.ndarray map using the provided connection."""
+        if not point_ids:
+            return {}
+
+        chunk_size = chunk_size or DatabaseConstants.EMBEDDING_CHUNK_SIZE
+        out: Dict[str, np.ndarray] = {}
+        effective_mode = self._normalize_query_mode(
+            query_mode or self._prefetch_query_mode
+        )
+
+        for i in range(0, len(point_ids), chunk_size):
+            chunk = point_ids[i : i + chunk_size]
+            prepared_chunk = self._coerce_id_list(prepare_ids_for_query(chunk))
+            predicate, params = self._build_id_predicate(
+                prepared_chunk,
+                query_mode=effective_mode,
+                id_column="id",
+            )
+            select_expr = getattr(self, "_embedding_select_expr", "embedding")
+            query = (
+                f"SELECT id, {select_expr} as embedding "
+                "FROM geo_embeddings "
+                f"WHERE {predicate}"
+            )
+            rows = connection.execute(query, params).fetchall()
+            for id_val, embedding in rows:
+                out[str(id_val)] = np.asarray(embedding, dtype=np.float32)
+
+        return out
 
     def nearest_point(self, lon: float, lat: float):
         import time
@@ -1210,21 +1639,31 @@ class DataManager:
         """
         return self.duckdb_connection.execute(sql, prepared_ids).df()
 
-    def query_search_metadata(self, faiss_ids: List[int]):
+    def query_search_metadata(
+        self, faiss_ids: List[int], query_mode: Optional[str] = None
+    ):
         if not faiss_ids:
             return None
-        placeholders = ",".join(["?" for _ in faiss_ids])
+        prepared_ids = self._coerce_id_list([int(id_) for id_ in faiss_ids])
+        effective_mode = self._normalize_query_mode(
+            query_mode or self._metadata_query_mode
+        )
 
         # Use local geometry cache for remote databases (much faster)
         if self._geometry_cache_connection is not None:
-            sql = f"""
-            SELECT id,
-                   ST_AsGeoJSON(geometry) AS geometry_json,
-                   ST_AsText(geometry) AS geometry_wkt
-            FROM geometry_cache
-            WHERE id IN ({placeholders})
-            """
-            return self._geometry_cache_connection.execute(sql, faiss_ids).fetchdf()
+            predicate, params = self._build_id_predicate(
+                prepared_ids,
+                query_mode=effective_mode,
+                id_column="id",
+            )
+            sql = (
+                "SELECT id, "
+                "ST_AsGeoJSON(geometry) AS geometry_json, "
+                "ST_AsText(geometry) AS geometry_wkt "
+                "FROM geometry_cache "
+                f"WHERE {predicate}"
+            )
+            return self._geometry_cache_connection.execute(sql, params).fetchdf()
 
         # Fall back to remote database query
         select_parts = ["id"]
@@ -1238,26 +1677,37 @@ class DataManager:
             ]
         )
         select_clause = ", ".join(select_parts)
-        sql = f"""
-        SELECT {select_clause}
-        FROM geo_embeddings
-        WHERE id IN ({placeholders})
-        """
-        return self.duckdb_connection.execute(sql, faiss_ids).fetchdf()
+        predicate, params = self._build_id_predicate(
+            prepared_ids,
+            query_mode=effective_mode,
+            id_column="id",
+        )
+        sql = (
+            f"SELECT {select_clause} "
+            "FROM geo_embeddings "
+            f"WHERE {predicate}"
+        )
+        return self.duckdb_connection.execute(sql, params).fetchdf()
 
     def switch_database(self, database_path: str):
         if database_path == self.current_database_path:
             return
+
+        self._close_auxiliary_connections()
 
         self.current_database_path = database_path
         self.current_database_info = self.database_info_by_path.get(database_path)
         if self.current_database_info:
             self.current_faiss_path = self.current_database_info["faiss_path"]
             self.current_geometry_path = self.current_database_info.get("geometry_path")
+            self.current_geometry_cache_path = self.current_database_info.get(
+                "geometry_cache_path"
+            )
             self.tile_spec = self.current_database_info.get("tile_spec")
         else:
             self.current_faiss_path = None
             self.current_geometry_path = None
+            self.current_geometry_cache_path = None
             self.tile_spec = None
 
         if not self.tile_spec:
@@ -1271,6 +1721,11 @@ class DataManager:
         self._owns_connection = True
         self._apply_duckdb_settings(database_path)
         self._refresh_id_columns()
+
+        if self.current_geometry_cache_path and self.is_remote_url(database_path):
+            self._load_geometry_cache(self.current_geometry_cache_path)
+        if self.is_remote_url(database_path):
+            self._load_row_group_cache(self._row_group_size)
 
         if not self.current_faiss_path:
             raise RuntimeError(

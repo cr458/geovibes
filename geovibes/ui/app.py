@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import json
 import math
+import os
+import threading
 import warnings
 from typing import Any, Dict, List, Optional
 
@@ -135,6 +137,42 @@ if not BasemapConfig.MAPTILER_API_KEY:
         "MAPTILER_API_KEY environment variable not set. Please create a .env file with your MapTiler API key.",
         RuntimeWarning,
     )
+
+
+def _env_int(name: str, default: int) -> int:
+    raw = os.getenv(name)
+    if raw is None:
+        return default
+    try:
+        return int(raw)
+    except ValueError:
+        return default
+
+
+def _env_float(name: str, default: float) -> float:
+    raw = os.getenv(name)
+    if raw is None:
+        return default
+    try:
+        return float(raw)
+    except ValueError:
+        return default
+
+
+FAISS_NPROBE_DEFAULT = max(1, _env_int("GEOVIBES_FAISS_NPROBE", 1024))
+FAISS_NPROBE_HIGH = max(FAISS_NPROBE_DEFAULT, _env_int("GEOVIBES_FAISS_NPROBE_HIGH", 2048))
+FAISS_NPROBE_HIGH_THRESHOLD = max(
+    1, _env_int("GEOVIBES_FAISS_NPROBE_HIGH_THRESHOLD", 5000)
+)
+PREFETCH_FAST_K_DEFAULT = max(1, _env_int("GEOVIBES_PREFETCH_FAST_K", 100))
+PREFETCH_TOPK_MIN = max(1, _env_int("GEOVIBES_PREFETCH_TOPK_MIN", 100))
+PREFETCH_TOPK_MAX = max(PREFETCH_TOPK_MIN, _env_int("GEOVIBES_PREFETCH_TOPK_MAX", 200))
+PREFETCH_TOPK_RATIO = max(0.01, _env_float("GEOVIBES_PREFETCH_TOPK_RATIO", 0.2))
+PREFETCH_WORKER_TARGET = max(1, _env_int("GEOVIBES_PREFETCH_WORKER_TARGET", 44))
+PREFETCH_WORKER_CAP = max(PREFETCH_WORKER_TARGET, _env_int("GEOVIBES_PREFETCH_WORKER_CAP", 44))
+PREFETCH_WORKER_FLOOR = max(1, _env_int("GEOVIBES_PREFETCH_WORKER_FLOOR", 16))
+PREFETCH_WORKER_MEM_MB = max(16, _env_int("GEOVIBES_PREFETCH_WORKER_MEM_MB", 96))
+EMBEDDING_LRU_SIZE = max(0, _env_int("GEOVIBES_EMBEDDING_LRU_SIZE", 2000))
 
 
 def group_databases_by_region(databases: List[Dict]) -> Dict[str, List[Dict]]:
@@ -278,6 +316,9 @@ class GeoVibes:
         self.id_column_candidates = getattr(self.data, "id_column_candidates", ["id"])
         self.external_id_column = getattr(self.data, "external_id_column", "id")
         self.state = AppState()
+        self._prefetch_generation = 0
+        self._prefetch_generation_lock = threading.Lock()
+        self._embedding_lru_size = EMBEDDING_LRU_SIZE
         self.status_bus = StatusBus()
         self.map_manager = MapManager(
             data_manager=self.data,
@@ -1102,8 +1143,8 @@ class GeoVibes:
         # Step 2: Extract and cache embedding
         step_start = time.perf_counter()
         point_id = str(result[0])
-        embedding = np.array(result[3])
-        self.state.cached_embeddings[point_id] = embedding
+        embedding = np.array(result[3], dtype=np.float32)
+        self._cache_put_embeddings({point_id: embedding})
         step_time = (time.perf_counter() - step_start) * 1000
         log_to_file(
             f"label_point: [2/4] Extract embedding completed in {step_time:.1f}ms (id={point_id})"
@@ -1269,18 +1310,14 @@ class GeoVibes:
 
             # Check which embeddings need fetching
             all_labeled_ids = self.state.pos_ids + self.state.neg_ids
-            uncached = [
-                pid
-                for pid in all_labeled_ids
-                if str(pid) not in self.state.cached_embeddings
-            ]
+            uncached = self._filter_uncached_ids(all_labeled_ids)
 
             if uncached:
                 # Start background prefetch, defer query vector update to search
                 self._show_operation_status(
                     f"✅ Labeled {labeled} points | Loading embeddings..."
                 )
-                self._prefetch_embeddings_async(uncached)
+                self._prefetch_embeddings_async(uncached, two_stage=True)
             else:
                 # All cached, update query vector immediately
                 self._update_query_vector()
@@ -1353,9 +1390,7 @@ class GeoVibes:
 
         # Ensure we have embeddings for all labeled points
         all_labeled = self.state.pos_ids + self.state.neg_ids
-        uncached = [
-            pid for pid in all_labeled if str(pid) not in self.state.cached_embeddings
-        ]
+        uncached = self._filter_uncached_ids(all_labeled)
         if uncached:
             self._show_operation_status(f"⏳ Fetching {len(uncached)} embeddings...")
             self._fetch_embeddings(uncached)
@@ -1415,7 +1450,12 @@ class GeoVibes:
         step_start = time.perf_counter()
         log_to_file("_search_faiss: [1/3] Running FAISS search...")
         query_vector_np = self.state.query_vector.reshape(1, -1).astype("float32")
-        params = faiss.SearchParametersIVF(nprobe=4096)
+        if n_neighbors >= FAISS_NPROBE_HIGH_THRESHOLD:
+            nprobe = FAISS_NPROBE_HIGH
+        else:
+            nprobe = FAISS_NPROBE_DEFAULT
+        params = faiss.SearchParametersIVF(nprobe=nprobe)
+        log_to_file(f"_search_faiss: Using nprobe={nprobe} for n_neighbors={n_neighbors}")
         self._show_operation_status(
             f"🔍 FAISS Search: Finding {n_neighbors} neighbors..."
         )
@@ -1470,7 +1510,17 @@ class GeoVibes:
         log_to_file(f"_search_faiss: DONE total={total_time:.1f}ms")
         log_to_file("=" * 60)
 
-        self._prefetch_embeddings_async(faiss_ids)
+        prefetch_top_k = self._suggest_prefetch_top_k(
+            n_neighbors=n_neighbors,
+            available_ids=len(faiss_ids),
+        )
+        if prefetch_top_k > 0:
+            prefetch_ids = faiss_ids[:prefetch_top_k]
+            log_to_file(
+                "_search_faiss: adaptive prefetch "
+                f"{prefetch_top_k}/{len(faiss_ids)} ids (n_neighbors={n_neighbors})"
+            )
+            self._prefetch_embeddings_async(prefetch_ids, two_stage=False)
 
     def _process_search_results(
         self, results_df: pd.DataFrame, n_neighbors: int
@@ -1554,15 +1604,101 @@ class GeoVibes:
     # Helpers
     # ------------------------------------------------------------------
 
+    @staticmethod
+    def _mem_available_mb() -> Optional[float]:
+        try:
+            with open("/proc/meminfo", "r", encoding="utf-8") as handle:
+                for line in handle:
+                    if line.startswith("MemAvailable:"):
+                        kb = float(line.split(":", 1)[1].strip().split()[0])
+                        return kb / 1024.0
+        except Exception:
+            return None
+        return None
+
+    def _cache_contains_embedding(self, point_id: object, touch: bool = True) -> bool:
+        key = str(point_id)
+        cache = self.state.cached_embeddings
+        if key not in cache:
+            return False
+        if touch and self._embedding_lru_size > 0:
+            value = cache.pop(key)
+            cache[key] = value
+        return True
+
+    def _trim_embedding_cache(self) -> None:
+        if self._embedding_lru_size <= 0:
+            return
+        cache = self.state.cached_embeddings
+        if len(cache) <= self._embedding_lru_size:
+            return
+
+        protected = {str(pid) for pid in (self.state.pos_ids + self.state.neg_ids)}
+        target_size = self._embedding_lru_size
+        removed = 0
+        for key in list(cache.keys()):
+            if len(cache) <= target_size:
+                break
+            if key in protected:
+                continue
+            cache.pop(key, None)
+            removed += 1
+        if removed > 0:
+            log_to_file(
+                f"embedding_lru: trimmed {removed} entries (size={len(cache)}, cap={target_size})"
+            )
+
+    def _cache_put_embeddings(self, embedding_map: Dict[str, np.ndarray]) -> None:
+        if not embedding_map:
+            return
+        cache = self.state.cached_embeddings
+        for key, value in embedding_map.items():
+            skey = str(key)
+            if skey in cache:
+                cache.pop(skey)
+            cache[skey] = np.asarray(value, dtype=np.float32)
+        self._trim_embedding_cache()
+
+    def _filter_uncached_ids(self, ids: list) -> list:
+        uncached = []
+        for point_id in ids:
+            if not self._cache_contains_embedding(point_id):
+                uncached.append(point_id)
+        return uncached
+
+    def _suggest_prefetch_top_k(self, n_neighbors: int, available_ids: int) -> int:
+        target = int(round(float(n_neighbors) * PREFETCH_TOPK_RATIO))
+        adaptive = max(PREFETCH_TOPK_MIN, min(PREFETCH_TOPK_MAX, target))
+        return max(0, min(int(available_ids), adaptive))
+
+    def _resolve_prefetch_workers(self, requested_workers: int, n_batches: int) -> int:
+        if n_batches <= 0:
+            return 1
+        workers = max(1, requested_workers)
+        workers = min(workers, PREFETCH_WORKER_CAP, n_batches)
+
+        # Memory-aware cap keeps behavior safe on smaller VMs.
+        mem_available_mb = self._mem_available_mb()
+        mem_cap: Optional[int] = None
+        if mem_available_mb is not None and PREFETCH_WORKER_MEM_MB > 0:
+            mem_cap = max(1, int(mem_available_mb // PREFETCH_WORKER_MEM_MB))
+            workers = min(workers, mem_cap)
+
+        floor = min(PREFETCH_WORKER_FLOOR, n_batches)
+        if mem_cap is not None:
+            floor = min(floor, mem_cap)
+        workers = max(1, min(workers, n_batches))
+        if workers < floor:
+            workers = floor
+        return max(1, min(workers, n_batches))
+
     def _fetch_embeddings(self, point_ids):
         import time
 
         if not point_ids:
             return
 
-        uncached_ids = [
-            pid for pid in point_ids if str(pid) not in self.state.cached_embeddings
-        ]
+        uncached_ids = self._filter_uncached_ids(point_ids)
 
         log_to_file(
             f"_fetch_embeddings: {len(point_ids)} requested, {len(uncached_ids)} uncached"
@@ -1573,34 +1709,42 @@ class GeoVibes:
             return
 
         start = time.perf_counter()
-        count = 0
-        for chunk_df in self.data.fetch_embeddings(uncached_ids):
-            for _, row in chunk_df.iterrows():
-                point_id = str(row["id"])
-                self.state.cached_embeddings[point_id] = np.array(row["embedding"])
-                count += 1
+        embedding_map = self.data.fetch_embedding_map(uncached_ids)
+        self._cache_put_embeddings(embedding_map)
+        count = len(embedding_map)
         elapsed = (time.perf_counter() - start) * 1000
         log_to_file(f"_fetch_embeddings: Fetched {count} embeddings in {elapsed:.1f}ms")
 
-    def _prefetch_embeddings_async(self, ids: list, n_workers: int = 32) -> None:
-        """Pre-fetch embeddings using row-group-aware parallel batching.
+    def _next_prefetch_generation(self) -> int:
+        with self._prefetch_generation_lock:
+            self._prefetch_generation += 1
+            return self._prefetch_generation
 
-        Groups IDs by DuckDB row group (id // 122880) to minimize HTTP requests,
-        then fetches each row group's IDs in parallel with separate connections.
-        This is ~2.6x faster than naive chunking because IDs in the same row group
-        are stored together on disk.
+    def _is_prefetch_generation_current(self, generation: int) -> bool:
+        with self._prefetch_generation_lock:
+            return generation == self._prefetch_generation
 
-        Updates state.embeddings_loading and shows status when complete.
+    def _prefetch_embeddings_async(
+        self, ids: list, n_workers: int = PREFETCH_WORKER_TARGET, two_stage: bool = True
+    ) -> None:
+        """Pre-fetch embeddings using row-group-aware batching.
+
+        Args:
+            ids: Candidate IDs to prefetch.
+            n_workers: Maximum worker threads.
+            two_stage: If True, prefetch top-K first for faster readiness and
+                continue tail in background. If False, fetch all in one stage.
         """
-        import threading
-        from collections import defaultdict
         from concurrent.futures import ThreadPoolExecutor, as_completed
 
         ROW_GROUP_SIZE = 122880  # DuckDB default
 
-        uncached = [i for i in ids if str(i) not in self.state.cached_embeddings]
+        generation = self._next_prefetch_generation()
+        uncached = self._filter_uncached_ids(ids)
         if not uncached:
             log_to_file(f"prefetch: All {len(ids)} embeddings already cached")
+            self.state.embeddings_loading = False
+            self.state.embeddings_pending_ids = []
             self._update_query_vector()
             return
 
@@ -1608,85 +1752,174 @@ class GeoVibes:
         self.state.embeddings_loading = True
         self.state.embeddings_pending_ids = uncached
 
-        # Group IDs by row group for optimal httpfs performance
-        rg_groups = defaultdict(list)
-        for id_ in uncached:
-            rg_groups[int(id_) // ROW_GROUP_SIZE].append(id_)
-        batches = list(rg_groups.values())
-
-        actual_workers = min(n_workers, len(batches), 48)
-        log_to_file(
-            f"prefetch: {len(uncached)} embeddings across {len(batches)} row groups "
-            f"({actual_workers} workers)"
-        )
+        if two_stage:
+            fast_ids = uncached[: max(0, min(PREFETCH_FAST_K_DEFAULT, len(uncached)))]
+            tail_ids = uncached[len(fast_ids) :]
+        else:
+            fast_ids = uncached
+            tail_ids = []
 
         def fetch_worker():
             import time
 
-            start = time.perf_counter()
-            n_batches = len(batches)
-            completed_batches = [0]  # Use list to allow mutation in nested func
+            start_total = time.perf_counter()
 
-            def fetch_batch(batch_ids):
-                if not batch_ids:
-                    return {}
-                conn = self.data.create_background_connection()
-                if conn is None:
-                    return {}
-                result = {}
-                for chunk_df in self.data.fetch_embeddings_with_connection(
-                    conn, batch_ids
-                ):
-                    for _, row in chunk_df.iterrows():
-                        result[str(row["id"])] = np.array(row["embedding"])
-                conn.close()
-                return result
+            fast_batches, fast_group_mode, fast_lookup_ms = (
+                self.data.group_ids_for_prefetch(fast_ids, row_group_size=ROW_GROUP_SIZE)
+                if fast_ids
+                else ([], "none", 0.0)
+            )
+            tail_batches, tail_group_mode, tail_lookup_ms = (
+                self.data.group_ids_for_prefetch(tail_ids, row_group_size=ROW_GROUP_SIZE)
+                if tail_ids
+                else ([], "none", 0.0)
+            )
+            n_batches_total = len(fast_batches) + len(tail_batches)
+            if n_batches_total == 0:
+                if self._is_prefetch_generation_current(generation):
+                    self.state.embeddings_loading = False
+                    self.state.embeddings_pending_ids = []
+                    self._on_prefetch_complete()
+                return
 
-            total_count = 0
-            with ThreadPoolExecutor(max_workers=actual_workers) as executor:
-                futures = [executor.submit(fetch_batch, batch) for batch in batches]
-                for future in as_completed(futures):
-                    chunk_result = future.result()
-                    self.state.cached_embeddings.update(chunk_result)
-                    total_count += len(chunk_result)
-                    completed_batches[0] += 1
-
-                    # Update progress periodically
-                    if (
-                        completed_batches[0] % 5 == 0
-                        or completed_batches[0] == n_batches
-                    ):
-                        pct = int(100 * completed_batches[0] / n_batches)
-                        try:
-                            import asyncio
-
-                            loop = asyncio.get_event_loop()
-                            loop.call_soon_threadsafe(
-                                lambda p=pct: self._show_operation_status(
-                                    f"⏳ Loading embeddings... {p}%"
-                                )
-                            )
-                        except RuntimeError:
-                            pass
-
-            elapsed = (time.perf_counter() - start) * 1000
+            pool_workers = self._resolve_prefetch_workers(n_workers, n_batches_total)
+            self.data.configure_background_connection_pool(pool_workers)
+            pool_stats = self.data.background_pool_stats()
             log_to_file(
-                f"prefetch: Completed {total_count} embeddings in {elapsed/1000:.1f}s"
+                f"prefetch[{generation}]: {len(uncached)} ids, "
+                f"fast={len(fast_ids)} ({len(fast_batches)} batches, mode={fast_group_mode}, lookup={fast_lookup_ms:.1f}ms), "
+                f"tail={len(tail_ids)} ({len(tail_batches)} batches, mode={tail_group_mode}, lookup={tail_lookup_ms:.1f}ms), "
+                f"pool(size={pool_stats['size']}, created={pool_stats['created']}, idle={pool_stats['idle']})"
             )
 
-            # Update state and UI from background thread
-            self.state.embeddings_loading = False
-            self.state.embeddings_pending_ids = []
+            completed_batches = 0
+            total_count = 0
+            had_error = False
+            fast_stage_elapsed_ms = 0.0
+            tail_skipped_stale = False
+            ready_notified = False
 
-            # Schedule UI update on main thread
+            def notify_ready_for_search(pending_ids: list[int]) -> None:
+                nonlocal ready_notified
+                if ready_notified:
+                    return
+                if not self._is_prefetch_generation_current(generation):
+                    return
+                ready_notified = True
+                self.state.embeddings_loading = False
+                self.state.embeddings_pending_ids = pending_ids
+                try:
+                    import asyncio
+
+                    loop = asyncio.get_event_loop()
+                    loop.call_soon_threadsafe(self._on_prefetch_complete)
+                except RuntimeError:
+                    self._on_prefetch_complete()
+
+            def run_stage(
+                stage_name: str, stage_batches: list[list[int]], update_progress: bool = True
+            ) -> tuple[int, float]:
+                nonlocal completed_batches, had_error
+                if not stage_batches:
+                    return 0, 0.0
+
+                stage_start = time.perf_counter()
+                actual_workers = min(pool_workers, len(stage_batches))
+                thread_local = threading.local()
+                acquired_connections: list = []
+                conn_lock = threading.Lock()
+
+                def get_thread_connection():
+                    conn = getattr(thread_local, "conn", None)
+                    if conn is None:
+                        conn = self.data.acquire_background_connection()
+                        if conn is None:
+                            raise RuntimeError("Failed to acquire background connection")
+                        thread_local.conn = conn
+                        with conn_lock:
+                            acquired_connections.append(conn)
+                    return conn
+
+                def fetch_batch(batch_ids):
+                    if not batch_ids:
+                        return {}
+                    conn = get_thread_connection()
+                    return self.data.fetch_embedding_map_with_connection(conn, batch_ids)
+
+                stage_count = 0
+                try:
+                    with ThreadPoolExecutor(max_workers=actual_workers) as executor:
+                        futures = [executor.submit(fetch_batch, batch) for batch in stage_batches]
+                        for future in as_completed(futures):
+                            try:
+                                chunk_result = future.result()
+                            except Exception as exc:
+                                had_error = True
+                                log_to_file(
+                                    f"prefetch[{generation}] {stage_name}: batch failed: {type(exc).__name__}: {exc}"
+                                )
+                                chunk_result = {}
+
+                            self._cache_put_embeddings(chunk_result)
+                            stage_count += len(chunk_result)
+                            completed_batches += 1
+
+                            if update_progress and (
+                                completed_batches % 5 == 0
+                                or completed_batches == n_batches_total
+                            ):
+                                pct = int(100 * completed_batches / n_batches_total)
+                                try:
+                                    import asyncio
+
+                                    loop = asyncio.get_event_loop()
+                                    loop.call_soon_threadsafe(
+                                        lambda p=pct: self._show_operation_status(
+                                            f"⏳ Loading embeddings... {p}%"
+                                        )
+                                    )
+                                except RuntimeError:
+                                    pass
+                finally:
+                    for conn in acquired_connections:
+                        self.data.release_background_connection(conn)
+
+                stage_elapsed_ms = (time.perf_counter() - stage_start) * 1000.0
+                log_to_file(
+                    f"prefetch[{generation}] {stage_name}: {stage_count} embeddings in {stage_elapsed_ms:.1f}ms"
+                )
+                return stage_count, stage_elapsed_ms
+
             try:
-                import asyncio
+                stage_count, fast_stage_elapsed_ms = run_stage(
+                    "fast", fast_batches, update_progress=True
+                )
+                total_count += stage_count
+                notify_ready_for_search(tail_ids)
 
-                loop = asyncio.get_event_loop()
-                loop.call_soon_threadsafe(self._on_prefetch_complete)
-            except RuntimeError:
-                # No event loop, call directly
-                self._on_prefetch_complete()
+                if not self._is_prefetch_generation_current(generation):
+                    tail_skipped_stale = True
+                else:
+                    stage_count, _ = run_stage("tail", tail_batches, update_progress=False)
+                    total_count += stage_count
+
+                elapsed = (time.perf_counter() - start_total) * 1000
+                suffix = " (with batch errors)" if had_error else ""
+                stale_suffix = " (tail skipped due newer prefetch)" if tail_skipped_stale else ""
+                log_to_file(
+                    f"prefetch[{generation}]: completed {total_count} embeddings "
+                    f"in {elapsed/1000:.1f}s (fast_stage={fast_stage_elapsed_ms:.1f}ms){suffix}{stale_suffix}"
+                )
+            finally:
+                # Only the latest prefetch run can finalize shared state.
+                if not self._is_prefetch_generation_current(generation):
+                    log_to_file(f"prefetch[{generation}]: stale completion ignored")
+                else:
+                    if not ready_notified:
+                        notify_ready_for_search([])
+                    else:
+                        self.state.embeddings_loading = False
+                        self.state.embeddings_pending_ids = []
 
         thread = threading.Thread(target=fetch_worker, daemon=True)
         thread.start()
@@ -1795,7 +2028,7 @@ class GeoVibes:
             return
 
         # Normal mode: fetch embeddings and apply label
-        if point_id not in self.state.cached_embeddings:
+        if not self._cache_contains_embedding(point_id):
             self._fetch_embeddings([point_id])
         result = self.state.apply_label(point_id, label)
         if result == "positive":
