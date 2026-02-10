@@ -214,6 +214,13 @@ class DatabaseConstants:
     LOAD httpfs;
     """
 
+    # Base URL for remote database discovery (scans all regions/dates)
+    DEFAULT_SEARCH_BASE_URL = "s3://us-west-2.opendata.source.coop/geovibes/search/"
+
+    # S3 endpoint for Source Cooperative
+    SOURCE_COOP_ENDPOINT = "https://data.source.coop"
+    SOURCE_COOP_BUCKET = "us-west-2.opendata.source.coop"
+
     @classmethod
     def get_memory_setup_queries(cls):
         """Get memory configuration queries."""
@@ -257,11 +264,23 @@ class DatabaseConstants:
         return path.startswith("gs://")
 
     @classmethod
-    def setup_duckdb_connection(cls, duckdb_path: str, read_only: bool = True):
-        """Set up DuckDB connection for both local and GCS databases.
+    def is_s3_path(cls, path: str) -> bool:
+        """Check if path is an S3 path.
 
         Args:
-            duckdb_path: Path to DuckDB database (local or GCS)
+            path: Path to check
+
+        Returns:
+            True if path is S3 URL, False otherwise
+        """
+        return path.startswith("s3://")
+
+    @classmethod
+    def setup_duckdb_connection(cls, duckdb_path: str, read_only: bool = True):
+        """Set up DuckDB connection for local, GCS, or S3 databases.
+
+        Args:
+            duckdb_path: Path to DuckDB database (local, GCS, or S3)
             read_only: Whether to open in read-only mode
 
         Returns:
@@ -272,12 +291,36 @@ class DatabaseConstants:
         if cls.is_gcs_path(duckdb_path):
             # For GCS paths, create in-memory connection and attach remote database
             conn = duckdb.connect(":memory:")
+            conn.execute("SET enable_progress_bar = false;")
 
             # Install and load httpfs extension
             conn.execute(cls.HTTPFS_EXTENSION_SETUP_QUERY)
 
             # Set up GCS authentication if credentials are available
             cls._setup_gcs_auth(conn)
+
+            # Attach the remote database
+            attach_query = f"ATTACH '{duckdb_path}' AS remote_db (READ_ONLY)"
+            conn.execute(attach_query)
+
+            # Create view to map table name for transparent access
+            conn.execute(
+                "CREATE VIEW geo_embeddings AS SELECT * FROM remote_db.geo_embeddings"
+            )
+
+            return conn
+        elif cls.is_s3_path(duckdb_path):
+            # For S3 paths, create in-memory connection and attach remote database
+            conn = duckdb.connect(":memory:")
+            conn.execute("SET enable_progress_bar = false;")
+
+            # Install and load required extensions
+            conn.execute("INSTALL httpfs; LOAD httpfs;")
+            conn.execute("INSTALL spatial; LOAD spatial;")
+            conn.execute("INSTALL aws; LOAD aws;")
+
+            # Load AWS credentials from environment/config
+            conn.execute("CALL load_aws_credentials();")
 
             # Attach the remote database
             attach_query = f"ATTACH '{duckdb_path}' AS remote_db (READ_ONLY)"
