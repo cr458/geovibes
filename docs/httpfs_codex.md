@@ -1011,3 +1011,57 @@ Integrate remaining practical optimizations into notebook/runtime loading flow s
   - integration across both deferred progressive load and standard connect/switch paths.
   - artifact/layout guardrails in build + publish pipeline.
   - tests + validation updates.
+
+## 2026-02-10 - Final conclusions and implementation decisions
+
+### What we should implement (and keep)
+1. Remote retrieval path defaults:
+   - metadata query: `VALUES` join
+   - embedding prefetch query: `IN (...)`
+   - batch scheduler: `id_ascending`
+   - workers: target `w44` with memory-aware fallback to lower tiers
+2. Prefetch behavior:
+   - adaptive depth with `top100` cap as default
+   - no global `top1000` prefetch in normal search path
+3. Connection strategy:
+   - pooled/reused background DuckDB connections
+   - eager pool precreation during remote DB load/switch
+4. Search controls:
+   - adaptive FAISS `nprobe` with `1024` default lane
+5. Safety/quality guardrails:
+   - fixed-size embedding type validation for publish/build (`FLOAT[dim]` / `UTINYINT[dim]`)
+   - required `id_idx` index validation
+
+### What is not worth implementing (current evidence)
+1. Query expansion via neighbor-assisted query vectors:
+   - higher latency, lower overlap consistency than baseline.
+2. Split-store parquet/DuckDB remote embedding variants:
+   - regressed sparse `id` fetch over httpfs.
+3. IVF-list storage reorder as a primary strategy (in current artifact path):
+   - limited measured upside vs implementation complexity/risk.
+4. Int16 simulation lane:
+   - no meaningful speed win in this retrieval path.
+5. `VALUES` join for embedding prefetch stage:
+   - tail-risk outliers in randomized trials.
+
+### Net acceleration achieved
+All deltas below are measured from harness reports already logged above.
+
+1. End-to-end iterative session (corrected, realistic, 30 trials):
+   - baseline old-like (`w32`): `7819.4ms`
+   - optimized current (`w44`): `4489.8ms`
+   - improvement: `42.6%` faster (`1.74x` throughput equivalent)
+2. Cache-conservative strict mode (`pool_scope=trial`):
+   - `8473.5ms` -> `7840.6ms`
+   - improvement: `7.5%` faster
+3. Warm in-session mode (`pool_scope=run`):
+   - `7657.8ms` -> `5841.2ms`
+   - improvement: `23.7%` faster
+4. Prefetch-depth refinement (`top100` vs `top200` in optimized lane):
+   - iterative corrected lane: `16.8%` faster
+   - overlap lane: `19.3%` faster
+   - warm-pool lane: `23.8%` faster
+
+### Bottom line
+- We now have a validated harness-backed retrieval path that is materially faster in real notebook usage patterns, with a conservative lower-bound gain around `7.5%` and realistic iterative-session gains around `42.6%`.
+- The strongest PR-safe implementation set is the one already integrated in runtime code and summarized above; further large structural storage changes should be treated as separate follow-up research.
