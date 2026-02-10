@@ -742,6 +742,147 @@ def task_queue() -> list[dict[str, Any]]:
         )
     )
 
+    # Lane V: prefetch depth refinement around top-100 default
+    tasks.append(
+        make_task(
+            "q27_prefetch_topk_100_vs_200",
+            "prefetch",
+            "Iterative session validation: prefetch_top_k=100 vs 200",
+            workload_overrides={
+                "n_trials": 12,
+                "n_neighbors_values": [1000],
+                "prefetch_top_k": 200,
+                "run_order": "trial_major",
+                "run_seed": 20260218,
+                "simulate_feedback": True,
+                "feedback_steps_per_seed": 6,
+                "feedback_top_k": 200,
+                "feedback_nprobe": 1024,
+                "feedback_add_positive": 1,
+                "feedback_add_negative": 0,
+                "feedback_max_positive_ids": 8,
+                "feedback_max_negative_ids": 4,
+                "embedding_lru_size": 2000,
+                "embedding_cache_scope": "strategy",
+                "pool_scope": "trial",
+            },
+            strategies=[
+                base_strategy(
+                    "optimized_top100_w44",
+                    n_workers=44,
+                    prefetch_top_k=100,
+                    metadata_query_mode="values_join",
+                    prefetch_query_mode="in_list",
+                    batch_scheduler="id_ascending",
+                    fetch_mode="fetchall",
+                ),
+                base_strategy(
+                    "optimized_top200_w44",
+                    n_workers=44,
+                    prefetch_top_k=200,
+                    metadata_query_mode="values_join",
+                    prefetch_query_mode="in_list",
+                    batch_scheduler="id_ascending",
+                    fetch_mode="fetchall",
+                ),
+            ],
+        )
+    )
+
+    overlap_triplets_prefetch = [
+        list(BASE_SOURCE["query_id_triplets"][0]),
+        list(BASE_SOURCE["query_id_triplets"][1]),
+        list(BASE_SOURCE["query_id_triplets"][0]),
+        list(BASE_SOURCE["query_id_triplets"][1]),
+        list(BASE_SOURCE["query_id_triplets"][0]),
+        list(BASE_SOURCE["query_id_triplets"][1]),
+    ]
+    tasks.append(
+        make_task(
+            "q28_prefetch_topk_100_vs_200_overlap",
+            "prefetch",
+            "Overlapping-query validation: prefetch_top_k=100 vs 200",
+            source_overrides={"query_id_triplets": overlap_triplets_prefetch},
+            workload_overrides={
+                "n_trials": 12,
+                "n_neighbors_values": [500],
+                "prefetch_top_k": 200,
+                "run_order": "trial_major",
+                "run_seed": 20260218,
+                "simulate_feedback": False,
+                "embedding_lru_size": 2000,
+                "embedding_cache_scope": "strategy",
+                "pool_scope": "trial",
+            },
+            strategies=[
+                base_strategy(
+                    "overlap_top100_w44",
+                    n_workers=44,
+                    prefetch_top_k=100,
+                    metadata_query_mode="values_join",
+                    prefetch_query_mode="in_list",
+                    batch_scheduler="id_ascending",
+                    fetch_mode="fetchall",
+                ),
+                base_strategy(
+                    "overlap_top200_w44",
+                    n_workers=44,
+                    prefetch_top_k=200,
+                    metadata_query_mode="values_join",
+                    prefetch_query_mode="in_list",
+                    batch_scheduler="id_ascending",
+                    fetch_mode="fetchall",
+                ),
+            ],
+        )
+    )
+
+    tasks.append(
+        make_task(
+            "q29_prefetch_topk_100_vs_200_warmpool",
+            "prefetch",
+            "Warm-pool validation: prefetch_top_k=100 vs 200",
+            workload_overrides={
+                "n_trials": 12,
+                "n_neighbors_values": [1000],
+                "prefetch_top_k": 200,
+                "run_order": "trial_major",
+                "run_seed": 20260219,
+                "simulate_feedback": True,
+                "feedback_steps_per_seed": 6,
+                "feedback_top_k": 200,
+                "feedback_nprobe": 1024,
+                "feedback_add_positive": 1,
+                "feedback_add_negative": 0,
+                "feedback_max_positive_ids": 8,
+                "feedback_max_negative_ids": 4,
+                "embedding_lru_size": 2000,
+                "embedding_cache_scope": "strategy",
+                "pool_scope": "run",
+            },
+            strategies=[
+                base_strategy(
+                    "optimized_top100_w44",
+                    n_workers=44,
+                    prefetch_top_k=100,
+                    metadata_query_mode="values_join",
+                    prefetch_query_mode="in_list",
+                    batch_scheduler="id_ascending",
+                    fetch_mode="fetchall",
+                ),
+                base_strategy(
+                    "optimized_top200_w44",
+                    n_workers=44,
+                    prefetch_top_k=200,
+                    metadata_query_mode="values_join",
+                    prefetch_query_mode="in_list",
+                    batch_scheduler="id_ascending",
+                    fetch_mode="fetchall",
+                ),
+            ],
+        )
+    )
+
     return tasks
 
 

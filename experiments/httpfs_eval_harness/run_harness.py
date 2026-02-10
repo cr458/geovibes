@@ -1726,6 +1726,7 @@ def run_harness(config: dict[str, Any]) -> dict[str, Any]:
             print(f"[{dataset_name}] row-group cache ready: {row_group_cache_path}")
 
         embedding_lru_cache: IdLruCache | None = None
+        strategy_embedding_lru: dict[str, IdLruCache] = {}
         if embedding_lru_size > 0 and embedding_cache_scope in {"run", "variant"}:
             embedding_lru_cache = IdLruCache(embedding_lru_size)
 
@@ -1752,7 +1753,6 @@ def run_harness(config: dict[str, Any]) -> dict[str, Any]:
                 f"Unknown run_order={run_order}. Use strategy_major, trial_major, or randomized."
             )
 
-        current_cache_strategy_name: str | None = None
         for strategy, n_neighbors, trial in run_plan:
             if pool_scope == "trial":
                 for pool in connection_pools.values():
@@ -1765,9 +1765,9 @@ def run_harness(config: dict[str, Any]) -> dict[str, Any]:
                 embedding_lru_cache = IdLruCache(embedding_lru_size)
             elif embedding_lru_size > 0 and embedding_cache_scope == "strategy":
                 strategy_name = str(strategy.get("name", ""))
-                if current_cache_strategy_name != strategy_name:
-                    embedding_lru_cache = IdLruCache(embedding_lru_size)
-                    current_cache_strategy_name = strategy_name
+                if strategy_name not in strategy_embedding_lru:
+                    strategy_embedding_lru[strategy_name] = IdLruCache(embedding_lru_size)
+                embedding_lru_cache = strategy_embedding_lru[strategy_name]
 
             triplet_idx = (trial - 1) % len(query_triplets)
             query_triplet = query_triplets[triplet_idx]

@@ -886,8 +886,87 @@ Test int16-style quantization simulation (query-only and query+prefetch expressi
   - prefetch `in_list`
   - `id_ascending` batching
   - worker target `w44` with memory-aware fallback
-  - adaptive prefetch depth (`~100-200`)
+  - adaptive prefetch depth centered on `top-100` (env-overridable)
   - app embedding LRU (`>=2000`)
 - Keep query vector baseline (no neighbor expansion).
 - Use native `embedding` SQL expression over explicit cast for float fixed-array sources.
 - Treat quantized datasets as an optional alternate model path, not a direct replacement for float32 semantics.
+
+## 2026-02-10 - Experiment 29 - Harness cache-scope correctness fix (`strategy` scope)
+
+### Goal
+Validate that `embedding_cache_scope: strategy` actually keeps independent cache state per strategy across interleaved runs.
+
+### Issue found
+- Existing implementation recreated the strategy cache whenever strategy switched in run order.
+- In `trial_major`/`randomized` plans this erased per-strategy history on every row, producing `0` cache hits and underestimating real reuse.
+
+### Fix
+- `experiments/httpfs_eval_harness/run_harness.py`
+  - Keep one `IdLruCache` per strategy name (`dict[str, IdLruCache]`) when scope is `strategy`.
+  - Preserve contamination isolation while retaining realistic per-strategy persistence.
+
+### Impact
+- Follow-up prefetch-depth experiments (below) now show non-zero per-strategy cache hits and more realistic steady-state behavior.
+
+## 2026-02-10 - Experiment 30 - Prefetch top-k refinement (`q27`)
+
+### Goal
+Re-test optimized runtime strategy with corrected cache scope: `prefetch_top_k=100` vs `200` under iterative sessions.
+
+### Report
+- `experiments/httpfs_eval_harness/results/queue_q27_prefetch_topk_100_vs_200.json`
+
+### Results (12 trials, iterative feedback, pool_scope=trial)
+- `optimized_top100_w44`: search mean `3169.6ms`, prefetch mean `3068.7ms`
+- `optimized_top200_w44`: search mean `3811.2ms`, prefetch mean `3710.6ms`
+- Cache-aware metrics:
+  - top100: cache hits `62.7`, effective prefetch IDs `37.3`
+  - top200: cache hits `128.3`, effective prefetch IDs `71.7`
+
+### Conclusion
+- Even after accounting for increased cache hits, `top100` remained clearly faster (`~16.8%` better mean search-path).
+
+## 2026-02-10 - Experiment 31 - Overlap-pattern validation (`q28`)
+
+### Goal
+Check whether repeated alternating queries make deeper prefetch (`200`) preferable once cache fills.
+
+### Report
+- `experiments/httpfs_eval_harness/results/queue_q28_prefetch_topk_100_vs_200_overlap.json`
+
+### Results (12 trials, alternating repeated queries)
+- `overlap_top100_w44`: search mean `862.0ms`, prefetch mean `763.7ms`
+- `overlap_top200_w44`: search mean `1068.0ms`, prefetch mean `970.2ms`
+- Both converge to near-zero prefetch after warmup, but `top200` still pays larger cold-start tax.
+
+### Conclusion
+- `top100` still wins in overlapping-query sessions (`~19.3%` faster mean search-path).
+
+## 2026-02-10 - Experiment 32 - Warm-pool robustness check (`q29`)
+
+### Goal
+Confirm `top100` vs `200` under warm pooled connections (`pool_scope=run`).
+
+### Report
+- `experiments/httpfs_eval_harness/results/queue_q29_prefetch_topk_100_vs_200_warmpool.json`
+
+### Results (12 trials, iterative feedback, warm pool)
+- `optimized_top100_w44`: search mean `1623.8ms`, prefetch mean `1522.1ms`
+- `optimized_top200_w44`: search mean `2130.3ms`, prefetch mean `2028.3ms`
+
+### Conclusion
+- `top100` remains better in warm-pool steady state (`~23.8%` faster mean search-path).
+
+## 2026-02-10 - Final update (additional wave)
+
+### Implemented
+1. Harness correctness:
+   - fixed `embedding_cache_scope: strategy` to maintain persistent per-strategy LRUs.
+2. Queue expansion:
+   - added `q27`-`q29` to `run_experiment_queue.py` and generated queue YAMLs.
+3. Runtime default:
+   - lowered default `GEOVIBES_PREFETCH_TOPK_MAX` from `200` to `100` in `geovibes/ui/app.py` (still env-overridable).
+
+### Updated recommendation
+- Default to `top100` adaptive prefetch cap for current httpfs retrieval path.
