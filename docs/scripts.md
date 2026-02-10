@@ -182,8 +182,148 @@ python geovibes/database/faiss_db.py \
 
 ---
 
+## geovibes/database/benchmark_httpfs.py
+
+Benchmarks DuckDB queries over httpfs (S3) vs local access.
+
+### Usage
+
+```bash
+# Benchmark remote S3 database vs local
+python -m geovibes.database.benchmark_httpfs \
+  --s3-url "s3://bucket/path/database.db" \
+  --local-path "local_databases/database.db" \
+  --endpoint-url "data.source.coop"
+
+# Custom coordinates
+python -m geovibes.database.benchmark_httpfs \
+  --s3-url "s3://bucket/db.db" \
+  --lon -86.5 --lat 32.5
+```
+
+### Arguments
+
+| Argument | Required | Description |
+|----------|----------|-------------|
+| `--s3-url` | Yes | S3 URL to DuckDB database |
+| `--local-path` | No | Local database path for comparison |
+| `--lon`, `--lat` | No | Coordinates for spatial queries (default: Alabama) |
+| `--endpoint-url` | No | Custom S3 endpoint (e.g., `data.source.coop`) |
+| `--output` | No | Output JSON file (default: `benchmark_results.json`) |
+
+### Benchmarks Performed
+
+1. **Cold start**: Time to connect and run first query
+2. **Nearest point**: Spatial distance query (10 runs)
+3. **Fetch by ID**: Fetch 10, 50, 100, 200, 500, 1000 rows (5 runs each)
+4. **Local baseline**: Same queries on local database (if provided)
+
+### Acceptance Criteria
+
+| Metric | Threshold |
+|--------|-----------|
+| Cold start | < 5000 ms |
+| Nearest point | < 500 ms |
+| Fetch 100 | < 1000 ms |
+| Fetch 500 | < 3000 ms |
+| Remote/local ratio | < 10x |
+
+---
+
+## geovibes/database/upload_for_httpfs.py
+
+Uploads DuckDB database to Source Cooperative S3 for httpfs benchmarking.
+
+### Usage
+
+```bash
+# With session token from Source Cooperative console
+python -m geovibes.database.upload_for_httpfs \
+  local_databases/database.db \
+  --session-token "YOUR_SESSION_TOKEN"
+```
+
+### Note
+
+Static Source Cooperative credentials are read-only. Session tokens with write access are required from the Source Cooperative console.
+
+---
+
+## geovibes/database/faiss_cache.py
+
+Downloads and caches FAISS indexes from S3 for local access.
+
+### Usage
+
+```python
+from geovibes.database.faiss_cache import FaissCache
+
+cache = FaissCache()  # Uses ~/.cache/geovibes/faiss/
+
+# Download and cache (or load from cache)
+index = cache.get_index("s3://bucket/path/index.faiss")
+
+# Check if cached
+if cache.is_cached("s3://bucket/path/index.faiss"):
+    print("Already downloaded")
+
+# Clear all cached indexes
+cache.clear_cache()
+```
+
+### Features
+
+- SHA256-based cache keys for deterministic paths
+- Atomic downloads (temp file + rename)
+- Validates indexes on load
+- Memory-mapped loading for efficiency
+
+---
+
+## geovibes/database/remote_db.py
+
+Connects to DuckDB databases on S3 via httpfs extension.
+
+### Usage
+
+```python
+from geovibes.database.remote_db import RemoteDuckDB
+
+# Connect to remote database
+db = RemoteDuckDB()
+db.connect("s3://bucket/path/database.db")
+
+# Query with SQL
+df = db.query("SELECT * FROM geo_embeddings LIMIT 10")
+
+# Fetch by ID (optimized for FAISS workflow)
+result = db.fetch_by_ids([1, 2, 3], columns=["id", "geometry"])
+
+# Fetch embeddings
+embeddings = db.fetch_embeddings([1, 2, 3])
+
+db.close()
+
+# Or use as context manager
+with RemoteDuckDB() as db:
+    db.connect("s3://bucket/db.db")
+    result = db.query("SELECT COUNT(*) FROM geo_embeddings")
+```
+
+### Error Handling
+
+| Error | Exception |
+|-------|-----------|
+| Database not found | `FileNotFoundError` |
+| Access denied | `PermissionError` |
+| Connection timeout | `TimeoutError` |
+
+---
+
 ## Related Files
 
 - `manifest.csv` — Database download manifest
 - `geovibes/database/cloud.py` — S3/GCS file operations
 - `geovibes/tiling.py` — MGRS tile grid generation
+- `docs/httpfs.md` — Remote database access planning document
+- `docs/source.md` — Source Cooperative access documentation

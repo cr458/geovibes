@@ -1,0 +1,46 @@
+# Cluster Storage Benchmark Configuration
+
+# Source database (will be reordered)
+source:
+  db_url: "s3://us-west-2.opendata.source.coop/geovibes/search/USA/alabama/2024-01-01-2025-01-01/httpfs/alabama_dino_vit_small_patch16_224_2024_2025_32_16_10/metadata.db"
+  faiss_url: "s3://us-west-2.opendata.source.coop/geovibes/search/USA/alabama/2024-01-01-2025-01-01/httpfs/alabama_dino_vit_small_patch16_224_2024_2025_32_16_10/faiss.index"
+
+# S3 destination for reordered databases
+s3_destination:
+  bucket: "us-west-2.opendata.source.coop"
+  prefix: "geovibes/experiments/cluster_storage_benchmark"
+
+# Local working directory
+local_dir: "/tmp/cluster_storage_benchmark"
+
+# DuckDB settings
+duckdb:
+  row_group_size: 122880  # Default DuckDB row group size
+
+# FAISS settings
+faiss:
+  n_super_clusters: 44  # Match number of row groups
+  nprobe: 64  # For search
+
+# Benchmark settings
+benchmark:
+  n_trials: 5  # Repetitions per configuration
+  n_embeddings: [100, 500, 1000]  # Embeddings to fetch
+  query_ids: [2660000, 1000000, 4000000]  # Different query points
+
+  # Fetch methods to compare
+  methods:
+    - name: "threadpool_32"
+      type: "threadpool"
+      n_workers: 32
+    - name: "duckdb_threads_32"
+      type: "duckdb_native"
+      n_threads: 32
+    - name: "duckdb_threads_64"
+      type: "duckdb_native"
+      n_threads: 64
+
+# Output settings
+output:
+  results_file: "results/benchmark_results.json"
+  figures_dir: "results/figures"

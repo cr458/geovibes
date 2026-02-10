@@ -41,7 +41,6 @@ dependencies = [
     "duckdb>1.0.0",
     "earthengine-api",
     "faiss-cpu",
-    "fiona",
     "flake8",
     "gcsfs",
     "geemap",
@@ -64,7 +63,6 @@ dependencies = [
     "pytest-cov",
     "python-dotenv",
     "PyYAML",
-    "rasterio",
     "s3fs",
     "scikit-learn",
     "shapely",
@@ -75,6 +73,13 @@ dependencies = [
     "playwright>=1.56.0",
     "xgboost>=2.0.0",
     "ipyvuetify>=1.11.3",
+    "boto3>=1.42.19",
+]
+
+[project.optional-dependencies]
+geoio = [
+    "fiona",
+    "rasterio",
 ]
 
 

@@ -1,0 +1,93 @@
+source:
+  faiss_url: s3://us-west-2.opendata.source.coop/geovibes/search/USA/alabama/2024-01-01-2025-01-01/httpfs/alabama_dino_vit_small_patch16_224_2024_2025_32_16_10/faiss.index
+  db_variants:
+  - name: baseline
+    db_url: s3://us-west-2.opendata.source.coop/geovibes/search/USA/alabama/2024-01-01-2025-01-01/httpfs/alabama_dino_vit_small_patch16_224_2024_2025_32_16_10/metadata.db
+    geometry_cache_url: s3://us-west-2.opendata.source.coop/geovibes/search/USA/alabama/2024-01-01-2025-01-01/httpfs/alabama_dino_vit_small_patch16_224_2024_2025_32_16_10/geometry_cache.parquet
+  query_ids:
+  - 2660000
+  - 1000000
+  - 4000000
+  query_id_triplets:
+  - - 78824
+    - 1033427
+    - 4970394
+  - - 592921
+    - 215330
+    - 4384211
+  - - 1686758
+    - 2662800
+    - 5070803
+  label_clicks:
+  - lon: -86.55
+    lat: 32.35
+  - lon: -86.3
+    lat: 32.55
+workload:
+  n_trials: 10
+  n_neighbors_values:
+  - 1000
+  prefetch_top_k: 200
+  prefetch_fast_k: 100
+  nprobe: 1024
+  reference_nprobe: 4096
+  row_group_size: 122880
+  pool_scope: trial
+  run_order: randomized
+  run_seed: 20260217
+  capture_faiss_ids: true
+  run_label_queries: false
+  query_embedding_expr: embedding
+  simulate_feedback: false
+  feedback_steps_per_seed: 1
+  feedback_top_k: 100
+  feedback_nprobe: 1024
+  feedback_add_positive: 1
+  feedback_add_negative: 0
+  feedback_max_positive_ids: 8
+  feedback_max_negative_ids: 4
+  prefetch_user_consumed_k: 100
+  embedding_lru_size: 0
+  embedding_cache_scope: run
+  runtime_settings:
+    enable_object_cache: false
+    extra_sql: []
+strategies:
+- name: float32_native
+  metadata_source: geometry_cache
+  prefetch_method: rowgroup_cache_threadpool_reuse_conn
+  n_workers: 44
+  use_connection_pool: true
+  fetch_mode: fetchall
+  prefetch_top_k: 200
+  metadata_query_mode: values_join
+  batch_scheduler: id_ascending
+  query_embedding_expr: embedding
+  embedding_expr: embedding
+- name: int16_sim_query_only
+  metadata_source: geometry_cache
+  prefetch_method: rowgroup_cache_threadpool_reuse_conn
+  n_workers: 44
+  use_connection_pool: true
+  fetch_mode: fetchall
+  prefetch_top_k: 200
+  metadata_query_mode: values_join
+  batch_scheduler: id_ascending
+  query_embedding_expr: LIST_TRANSFORM(embedding, x -> CAST(CAST(ROUND(x * 1024.0)
+    AS SMALLINT) AS FLOAT) / 1024.0)
+  embedding_expr: embedding
+- name: int16_sim_query_prefetch
+  metadata_source: geometry_cache
+  prefetch_method: rowgroup_cache_threadpool_reuse_conn
+  n_workers: 44
+  use_connection_pool: true
+  fetch_mode: fetchall
+  prefetch_top_k: 200
+  metadata_query_mode: values_join
+  batch_scheduler: id_ascending
+  query_embedding_expr: LIST_TRANSFORM(embedding, x -> CAST(CAST(ROUND(x * 1024.0)
+    AS SMALLINT) AS FLOAT) / 1024.0)
+  embedding_expr: LIST_TRANSFORM(embedding, x -> CAST(CAST(ROUND(x * 1024.0) AS SMALLINT)
+    AS FLOAT) / 1024.0)
+output:
+  directory: results
