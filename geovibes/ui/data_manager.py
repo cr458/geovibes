@@ -273,8 +273,16 @@ class DataManager:
             self._load_row_group_cache(self._row_group_size)
 
         # Warm up remote databases to preload row groups
+        pool_precreate_thread: Optional[threading.Thread] = None
         if self.is_remote_url(self.current_database_path):
+            pool_target = self.suggest_background_pool_size()
+            pool_precreate_thread = self.start_background_pool_precreation(
+                pool_target,
+                n_workers=pool_target,
+            )
             self._warm_up_remote_database()
+            if pool_precreate_thread is not None and pool_precreate_thread.is_alive():
+                pool_precreate_thread.join(timeout=10.0)
 
         # Derive map centering data
         self.effective_boundary_path, (self.center_y, self.center_x) = (
@@ -1008,6 +1016,54 @@ class DataManager:
             return "embedding"
         return "CAST(embedding AS FLOAT[])"
 
+    @staticmethod
+    def _env_int(name: str, default: int) -> int:
+        raw = os.getenv(name)
+        if raw is None:
+            return default
+        try:
+            return int(raw)
+        except ValueError:
+            return default
+
+    @staticmethod
+    def _mem_available_mb() -> Optional[float]:
+        try:
+            with open("/proc/meminfo", "r", encoding="utf-8") as handle:
+                for line in handle:
+                    if line.startswith("MemAvailable:"):
+                        kb = float(line.split(":", 1)[1].strip().split()[0])
+                        return kb / 1024.0
+        except Exception:
+            return None
+        return None
+
+    def suggest_background_pool_size(self, requested: Optional[int] = None) -> int:
+        """Suggest a memory-safe background pool size for remote prefetch."""
+        target_default = self._env_int("GEOVIBES_PREFETCH_WORKER_TARGET", 44)
+        cap_default = self._env_int("GEOVIBES_PREFETCH_WORKER_CAP", 44)
+        floor_default = self._env_int("GEOVIBES_PREFETCH_WORKER_FLOOR", 16)
+        mem_per_conn_mb = max(
+            16, self._env_int("GEOVIBES_PREFETCH_WORKER_MEM_MB", 96)
+        )
+
+        target = max(1, int(requested if requested is not None else target_default))
+        cap = max(target, int(cap_default))
+        floor = max(1, int(floor_default))
+        size = min(target, cap)
+
+        mem_available_mb = self._mem_available_mb()
+        mem_cap: Optional[int] = None
+        if mem_available_mb is not None and mem_per_conn_mb > 0:
+            mem_cap = max(1, int(mem_available_mb // mem_per_conn_mb))
+            size = min(size, mem_cap)
+
+        if mem_cap is not None:
+            floor = min(floor, mem_cap)
+        floor = min(floor, cap)
+        size = max(1, min(cap, max(size, floor)))
+        return int(size)
+
     def _warm_up_remote_database(self) -> None:
         """Warm up remote database by preloading row groups.
 
@@ -1305,6 +1361,82 @@ class DataManager:
             self._background_pool_queue = queue.LifoQueue(maxsize=target_size)
             self._background_pool_size = target_size
             self._background_pool_created = 0
+
+    def precreate_background_connection_pool(
+        self, max_connections: int, n_workers: Optional[int] = None
+    ) -> Dict[str, float]:
+        """Eagerly pre-create background connections to reduce first-search latency."""
+        self.configure_background_connection_pool(max_connections)
+        stats_before = self.background_pool_stats()
+        target_size = int(stats_before.get("size", 0))
+        if target_size <= 0:
+            return {
+                "target_size": 0.0,
+                "created_ok": 0.0,
+                "elapsed_ms": 0.0,
+                "idle": 0.0,
+            }
+
+        from concurrent.futures import ThreadPoolExecutor, as_completed
+        import time
+
+        workers = max(1, min(int(n_workers or target_size), target_size))
+        start = time.perf_counter()
+
+        def _prime_once() -> int:
+            conn = self.acquire_background_connection(timeout_seconds=60.0)
+            if conn is None:
+                return 0
+            self.release_background_connection(conn)
+            return 1
+
+        created_ok = 0
+        with ThreadPoolExecutor(max_workers=workers) as executor:
+            futures = [executor.submit(_prime_once) for _ in range(target_size)]
+            for future in as_completed(futures):
+                try:
+                    created_ok += int(future.result())
+                except Exception:
+                    pass
+
+        elapsed_ms = (time.perf_counter() - start) * 1000.0
+
+        stats_after = self.background_pool_stats()
+        if self.verbose:
+            print(
+                "✅ Background pool pre-created "
+                f"(size={stats_after['size']}, created={stats_after['created']}, idle={stats_after['idle']}, "
+                f"elapsed={elapsed_ms:.1f}ms)"
+            )
+
+        return {
+            "target_size": float(target_size),
+            "created_ok": float(created_ok),
+            "elapsed_ms": float(elapsed_ms),
+            "idle": float(stats_after.get("idle", 0)),
+        }
+
+    def start_background_pool_precreation(
+        self, max_connections: int, n_workers: Optional[int] = None
+    ) -> Optional[threading.Thread]:
+        """Start background pool pre-creation asynchronously."""
+        if (
+            max_connections <= 0
+            or not self.current_database_path
+            or not self.is_remote_url(self.current_database_path)
+        ):
+            return None
+
+        thread = threading.Thread(
+            target=self.precreate_background_connection_pool,
+            kwargs={
+                "max_connections": int(max_connections),
+                "n_workers": int(n_workers) if n_workers is not None else None,
+            },
+            daemon=True,
+        )
+        thread.start()
+        return thread
 
     def acquire_background_connection(
         self, timeout_seconds: float = 30.0
@@ -1734,10 +1866,20 @@ class DataManager:
 
         self.faiss_index = self._load_faiss_index(self.current_faiss_path)
         self.embedding_dim = self._detect_embedding_dim()
+        self.embedding_type = self._detect_embedding_type()
+        self._embedding_select_expr = self._resolve_embedding_select_expr()
+        pool_precreate_thread: Optional[threading.Thread] = None
         if DatabaseConstants.is_gcs_path(database_path) or DatabaseConstants.is_s3_path(
             database_path
         ):
+            pool_target = self.suggest_background_pool_size()
+            pool_precreate_thread = self.start_background_pool_precreation(
+                pool_target,
+                n_workers=pool_target,
+            )
             self._warm_up_remote_database()
+            if pool_precreate_thread is not None and pool_precreate_thread.is_alive():
+                pool_precreate_thread.join(timeout=10.0)
 
         self.effective_boundary_path, (self.center_y, self.center_x) = (
             self._setup_boundary_and_center()

@@ -191,6 +191,62 @@ def optimize_database(input_db: Path, output_db: Path) -> None:
     logger.info(f"✓ Optimized database: {final_count:,} rows, {size_gb:.2f} GB")
 
 
+def _parse_fixed_array_dim(type_str: str) -> int | None:
+    match = re.match(r"^[A-Z0-9_]+\[(\d+)\]$", str(type_str).strip().upper())
+    if not match:
+        return None
+    return int(match.group(1))
+
+
+def validate_httpfs_layout(db_path: Path) -> None:
+    """Validate critical httpfs performance guardrails before publish."""
+    logger.info("Validating database layout for httpfs...")
+    con = duckdb.connect(str(db_path), read_only=True)
+    try:
+        embedding_type_row = con.execute(
+            "SELECT typeof(embedding) FROM geo_embeddings LIMIT 1"
+        ).fetchone()
+        if not embedding_type_row or embedding_type_row[0] is None:
+            raise RuntimeError("Could not infer embedding column type from geo_embeddings")
+
+        embedding_type = str(embedding_type_row[0]).upper()
+        embedding_dim = _parse_fixed_array_dim(embedding_type)
+        if embedding_dim is None:
+            raise RuntimeError(
+                f"Embedding type must be fixed-size for httpfs performance, got '{embedding_type}'"
+            )
+
+        index_rows = con.execute(
+            "SELECT index_name FROM duckdb_indexes() WHERE table_name='geo_embeddings'"
+        ).fetchall()
+        index_names = {str(row[0]) for row in index_rows if row and row[0]}
+        if "id_idx" not in index_names:
+            raise RuntimeError("Missing required id index 'id_idx' on geo_embeddings(id)")
+
+        row_group_count = None
+        try:
+            storage_rows = con.execute("PRAGMA storage_info('geo_embeddings')").fetchall()
+            row_groups = {int(row[0]) for row in storage_rows if row and row[0] is not None}
+            row_group_count = len(row_groups)
+            if row_group_count <= 0:
+                raise RuntimeError("No row groups discovered in geo_embeddings storage layout")
+        except Exception as exc:
+            logger.warning(f"Could not inspect row-group layout: {exc}")
+
+        logger.info(
+            "✓ Layout validation passed: embedding=%s, dim=%d, id_idx=yes%s",
+            embedding_type,
+            embedding_dim,
+            (
+                f", row_groups={row_group_count}"
+                if row_group_count is not None
+                else ""
+            ),
+        )
+    finally:
+        con.close()
+
+
 def generate_geometry_cache(db_path: Path, output_path: Path) -> None:
     """Extract id + geometry from database to compressed Parquet."""
     logger.info("Generating geometry cache...")
@@ -269,6 +325,8 @@ def publish_database(
         final_db = db_path
         cleanup_db = False
         logger.info("Skipping optimization (database already optimized by faiss_db.py)")
+
+    validate_httpfs_layout(final_db)
 
     # Step 2: Generate geometry cache
     geometry_cache = work_dir / "geometry_cache.parquet"

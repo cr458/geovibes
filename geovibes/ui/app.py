@@ -938,10 +938,22 @@ class GeoVibes:
                     self.state.loading_message = "Downloading geometry cache..."
                     self.data._load_geometry_cache(geometry_url)
 
-                # Step 4: Warm up database
+                # Step 4: Prime connection pool + warm up database
                 self._show_operation_status("🔄 Warming up database...")
                 self.state.loading_message = "Warming up..."
+                pool_target = self.data.suggest_background_pool_size(
+                    PREFETCH_WORKER_TARGET
+                )
+                pool_precreate_thread = self.data.start_background_pool_precreation(
+                    pool_target,
+                    n_workers=pool_target,
+                )
                 self.data._warm_up_remote_database()
+                if (
+                    pool_precreate_thread is not None
+                    and pool_precreate_thread.is_alive()
+                ):
+                    pool_precreate_thread.join(timeout=10.0)
 
                 # Success - update UI on main thread
                 self._on_loading_complete(db_info)

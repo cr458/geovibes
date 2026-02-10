@@ -425,3 +425,46 @@ class TestBackgroundConnectionPool:
         dm.configure_background_connection_pool(4)
         stats = dm.background_pool_stats()
         assert stats["size"] == 0
+
+    def test_precreate_background_pool_fills_idle_connections(self):
+        from geovibes.ui.data_manager import DataManager
+
+        dm = DataManager.__new__(DataManager)
+        dm.verbose = False
+        dm.current_database_path = "s3://bucket/path/metadata.db"
+        created = []
+
+        def fake_connect(_path):
+            conn = self._DummyConn(f"conn-{len(created)}")
+            created.append(conn)
+            return conn
+
+        dm._connect_duckdb = fake_connect
+
+        result = dm.precreate_background_connection_pool(3, n_workers=3)
+        stats = dm.background_pool_stats()
+
+        assert stats["size"] == 3
+        assert stats["created"] == 3
+        assert stats["idle"] == 3
+        assert result["created_ok"] == 3.0
+
+        dm._close_background_connection_pool()
+        assert all(conn.closed for conn in created)
+
+    def test_suggest_background_pool_size_respects_memory_cap(self, monkeypatch):
+        from geovibes.ui.data_manager import DataManager
+
+        dm = DataManager.__new__(DataManager)
+        monkeypatch.setenv("GEOVIBES_PREFETCH_WORKER_TARGET", "44")
+        monkeypatch.setenv("GEOVIBES_PREFETCH_WORKER_CAP", "44")
+        monkeypatch.setenv("GEOVIBES_PREFETCH_WORKER_FLOOR", "16")
+        monkeypatch.setenv("GEOVIBES_PREFETCH_WORKER_MEM_MB", "96")
+        monkeypatch.setattr(
+            DataManager,
+            "_mem_available_mb",
+            staticmethod(lambda: 300.0),
+        )
+
+        size = dm.suggest_background_pool_size()
+        assert size == 3

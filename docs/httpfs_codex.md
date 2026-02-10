@@ -970,3 +970,44 @@ Confirm `top100` vs `200` under warm pooled connections (`pool_scope=run`).
 
 ### Updated recommendation
 - Default to `top100` adaptive prefetch cap for current httpfs retrieval path.
+
+## 2026-02-10 - Experiment 33 - Notebook runtime integration (Opus + Codex)
+
+### Goal
+Integrate remaining practical optimizations into notebook/runtime loading flow so users see gains during normal interactive usage.
+
+### Implemented
+1. Eager background pool pre-creation for remote DBs:
+   - `geovibes/ui/data_manager.py`
+     - added memory-aware pool sizing:
+       - `suggest_background_pool_size(...)`
+       - `GEOVIBES_PREFETCH_WORKER_TARGET/CAP/FLOOR/MEM_MB` respected
+     - added eager pool priming:
+       - `precreate_background_connection_pool(...)`
+       - `start_background_pool_precreation(...)`
+     - integrated precreate + warmup during:
+       - `_connect_to_database_internal(...)`
+       - `switch_database(...)`
+   - `geovibes/ui/app.py`
+     - progressive remote loading now starts pool precreation before warmup and waits briefly for completion.
+2. Build/publish guardrails to prevent artifact regressions:
+   - `geovibes/database/faiss_db.py`
+     - added `_validate_httpfs_artifact_layout(...)` after table build/indexing.
+     - validates fixed-size embedding type (`FLOAT[dim]`/`UTINYINT[dim]`) and required `id_idx`.
+   - `scripts/publish_to_source_coop.py`
+     - added `validate_httpfs_layout(...)` before upload.
+     - validates fixed-size embedding type and presence of `id_idx`.
+3. Tests:
+   - `tests/test_data_manager_remote.py`
+     - added eager pool precreate test.
+     - added memory-cap sizing test.
+   - full relevant suite remains green (`34 passed, 17 skipped`).
+
+### Attribution
+- Opus-origin idea:
+  - eager connection pool precreation during startup/loading to reduce first-search latency.
+- Codex additions in this implementation:
+  - memory-aware sizing and safety integration with existing worker caps.
+  - integration across both deferred progressive load and standard connect/switch paths.
+  - artifact/layout guardrails in build + publish pipeline.
+  - tests + validation updates.

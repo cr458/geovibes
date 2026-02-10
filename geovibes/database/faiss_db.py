@@ -46,6 +46,61 @@ class IngestParquetError(Exception):
     pass
 
 
+def _parse_fixed_array_dim(type_str: str) -> Optional[int]:
+    value = str(type_str).strip().upper()
+    if "[" not in value or not value.endswith("]"):
+        return None
+    try:
+        return int(value.split("[", 1)[1][:-1])
+    except ValueError:
+        return None
+
+
+def _validate_httpfs_artifact_layout(
+    con: duckdb.DuckDBPyConnection,
+    *,
+    embedding_dim: int,
+    dtype: str,
+) -> None:
+    """Fail-fast guardrails for remote/httpfs retrieval artifacts."""
+    row = con.execute("SELECT typeof(embedding) FROM geo_embeddings LIMIT 1").fetchone()
+    if not row or row[0] is None:
+        raise IngestParquetError("Could not detect embedding type from geo_embeddings")
+
+    embedding_type = str(row[0]).upper()
+    actual_dim = _parse_fixed_array_dim(embedding_type)
+    expected_prefix = "UTINYINT" if dtype.upper() == "INT8" else "FLOAT"
+    if actual_dim != int(embedding_dim) or not embedding_type.startswith(
+        f"{expected_prefix}["
+    ):
+        raise IngestParquetError(
+            f"Unexpected embedding type '{embedding_type}'. "
+            f"Expected fixed-size {expected_prefix}[{embedding_dim}]"
+        )
+
+    index_rows = con.execute(
+        "SELECT index_name FROM duckdb_indexes() WHERE table_name='geo_embeddings'"
+    ).fetchall()
+    index_names = {str(r[0]) for r in index_rows if r and r[0]}
+    if "id_idx" not in index_names:
+        raise IngestParquetError("Missing required id index 'id_idx' on geo_embeddings(id)")
+
+    try:
+        storage_rows = con.execute("PRAGMA storage_info('geo_embeddings')").fetchall()
+        row_groups = {int(r[0]) for r in storage_rows if r and r[0] is not None}
+        if not row_groups:
+            raise IngestParquetError("No row groups discovered in geo_embeddings")
+        logging.info(
+            "Artifact layout validation passed: embedding=%s, row_groups=%d",
+            embedding_type,
+            len(row_groups),
+        )
+    except IngestParquetError:
+        raise
+    except Exception as exc:
+        logging.warning(f"Could not inspect row-group layout: {exc}")
+
+
 def infer_embedding_dim_from_file(parquet_file: str, embedding_col: str) -> int:
     with duckdb.connect() as con_inf:
         ensure_duckdb_extension(con_inf, "httpfs")
@@ -315,6 +370,12 @@ def ingest_parquet_to_duckdb(
         logging.info("Creating index on id column for fast lookups...")
         con.execute("CREATE INDEX id_idx ON geo_embeddings(id);")
         logging.info("ID index created successfully.")
+
+        _validate_httpfs_artifact_layout(
+            con,
+            embedding_dim=embedding_dim,
+            dtype=dtype,
+        )
 
         return embedding_dim
 
