@@ -46,6 +46,61 @@ class IngestParquetError(Exception):
     pass
 
 
+def _parse_fixed_array_dim(type_str: str) -> Optional[int]:
+    value = str(type_str).strip().upper()
+    if "[" not in value or not value.endswith("]"):
+        return None
+    try:
+        return int(value.split("[", 1)[1][:-1])
+    except ValueError:
+        return None
+
+
+def _validate_httpfs_artifact_layout(
+    con: duckdb.DuckDBPyConnection,
+    *,
+    embedding_dim: int,
+    dtype: str,
+) -> None:
+    """Fail-fast guardrails for remote/httpfs retrieval artifacts."""
+    row = con.execute("SELECT typeof(embedding) FROM geo_embeddings LIMIT 1").fetchone()
+    if not row or row[0] is None:
+        raise IngestParquetError("Could not detect embedding type from geo_embeddings")
+
+    embedding_type = str(row[0]).upper()
+    actual_dim = _parse_fixed_array_dim(embedding_type)
+    expected_prefix = "UTINYINT" if dtype.upper() == "INT8" else "FLOAT"
+    if actual_dim != int(embedding_dim) or not embedding_type.startswith(
+        f"{expected_prefix}["
+    ):
+        raise IngestParquetError(
+            f"Unexpected embedding type '{embedding_type}'. "
+            f"Expected fixed-size {expected_prefix}[{embedding_dim}]"
+        )
+
+    index_rows = con.execute(
+        "SELECT index_name FROM duckdb_indexes() WHERE table_name='geo_embeddings'"
+    ).fetchall()
+    index_names = {str(r[0]) for r in index_rows if r and r[0]}
+    if "id_idx" not in index_names:
+        raise IngestParquetError("Missing required id index 'id_idx' on geo_embeddings(id)")
+
+    try:
+        storage_rows = con.execute("PRAGMA storage_info('geo_embeddings')").fetchall()
+        row_groups = {int(r[0]) for r in storage_rows if r and r[0] is not None}
+        if not row_groups:
+            raise IngestParquetError("No row groups discovered in geo_embeddings")
+        logging.info(
+            "Artifact layout validation passed: embedding=%s, row_groups=%d",
+            embedding_type,
+            len(row_groups),
+        )
+    except IngestParquetError:
+        raise
+    except Exception as exc:
+        logging.warning(f"Could not inspect row-group layout: {exc}")
+
+
 def infer_embedding_dim_from_file(parquet_file: str, embedding_col: str) -> int:
     with duckdb.connect() as con_inf:
         ensure_duckdb_extension(con_inf, "httpfs")
@@ -296,12 +351,31 @@ def ingest_parquet_to_duckdb(
         row_count = con.execute("SELECT COUNT(*) FROM geo_embeddings;").fetchone()[0]
         logging.info(f"Successfully ingested {row_count} rows into DuckDB.")
 
+        # Reorder table by id for optimal zone map performance over httpfs
+        logging.info("Reordering table by id for optimal remote query performance...")
+        con.execute(
+            "CREATE TABLE geo_embeddings_ordered AS SELECT * FROM geo_embeddings ORDER BY id"
+        )
+        con.execute("DROP TABLE geo_embeddings")
+        con.execute("ALTER TABLE geo_embeddings_ordered RENAME TO geo_embeddings")
+        logging.info("Table reordered successfully.")
+
         if has_geometry:
             logging.info("Creating R-Tree spatial index on geometry column...")
             con.execute(
                 "CREATE INDEX geom_spatial_idx ON geo_embeddings USING RTREE (geometry);"
             )
             logging.info("Spatial index created successfully.")
+
+        logging.info("Creating index on id column for fast lookups...")
+        con.execute("CREATE INDEX id_idx ON geo_embeddings(id);")
+        logging.info("ID index created successfully.")
+
+        _validate_httpfs_artifact_layout(
+            con,
+            embedding_dim=embedding_dim,
+            dtype=dtype,
+        )
 
         return embedding_dim
 
@@ -420,6 +494,38 @@ def create_faiss_index(
         logging.info(f"Writing index to {index_path}")
         faiss.write_index(index, index_path)
         logging.info("FAISS index successfully built and saved.")
+
+
+def export_geometry_cache(db_path: str, output_path: str) -> None:
+    """Export id + geometry to compressed Parquet for local caching.
+
+    This creates a lightweight file (~50-100MB) containing only the id and
+    geometry columns, which can be downloaded and cached locally for fast
+    search metadata queries over httpfs.
+
+    Args:
+        db_path: Path to the DuckDB database
+        output_path: Path for the output Parquet file
+    """
+    logging.info(f"Exporting geometry cache to {output_path}")
+    start_time = time.time()
+
+    con = duckdb.connect(db_path, read_only=True)
+    con.execute("INSTALL spatial; LOAD spatial;")
+
+    row_count = con.execute("SELECT COUNT(*) FROM geo_embeddings").fetchone()[0]
+    logging.info(f"Exporting {row_count:,} geometries...")
+
+    con.execute(f"""
+        COPY (SELECT id, geometry FROM geo_embeddings ORDER BY id)
+        TO '{output_path}' (FORMAT PARQUET, COMPRESSION ZSTD)
+    """)
+
+    con.close()
+
+    file_size_mb = pathlib.Path(output_path).stat().st_size / (1024 * 1024)
+    elapsed = time.time() - start_time
+    logging.info(f"Geometry cache exported: {file_size_mb:.1f} MB in {elapsed:.1f}s")
 
 
 def _prefix_name_with_roi(name: str, roi_file: Optional[str]) -> str:
@@ -585,9 +691,11 @@ def main():
     faiss_params_str = f"faiss_{args.nlist}_{args.m}_{args.nbits}"
     db_filename = f"{args.name}_metadata.db"
     index_filename = f"{args.name}_{faiss_params_str}.index"
+    geometry_cache_filename = f"{args.name}_geometry.parquet"
 
     db_path = str((local_output_dir / db_filename).resolve())
     index_path = str((local_output_dir / index_filename).resolve())
+    geometry_cache_path = str((local_output_dir / geometry_cache_filename).resolve())
 
     # Validate mutual exclusivity and ROI-based arguments
     if getattr(args, "roi_file", None) and args.parquet_files:
@@ -764,11 +872,14 @@ def main():
         args.batch_size,
     )
 
+    # --- Phase 3: Export geometry cache for httpfs optimization ---
+    export_geometry_cache(db_path, geometry_cache_path)
+
     logging.info(
         f"Total process completed in {time.time() - start_total_time:.2f} seconds."
     )
     logging.info(
-        f"Artifacts created:\n- DuckDB: {db_path}\n- FAISS Index: {index_path}"
+        f"Artifacts created:\n- DuckDB: {db_path}\n- FAISS Index: {index_path}\n- Geometry Cache: {geometry_cache_path}"
     )
 
     if temp_dir and temp_dir_created:
@@ -787,7 +898,7 @@ def main():
                 tar_local_dir = str(local_output_dir)
             tar_local_path = os.path.join(tar_local_dir, tar_name)
 
-            cmd = f"tar -c {shlex.quote(db_path)} {shlex.quote(index_path)} | pigz > {shlex.quote(tar_local_path)}"
+            cmd = f"tar -c {shlex.quote(db_path)} {shlex.quote(index_path)} {shlex.quote(geometry_cache_path)} | pigz > {shlex.quote(tar_local_path)}"
             try:
                 subprocess.run(["bash", "-lc", cmd], check=True)
                 logging.info(f"Created tarball with pigz: {tar_local_path}")
@@ -795,7 +906,7 @@ def main():
                 logging.warning(
                     f"pigz tarball creation failed ({e}); falling back to gzip."
                 )
-                fallback_cmd = f"tar -czf {shlex.quote(tar_local_path)} {shlex.quote(db_path)} {shlex.quote(index_path)}"
+                fallback_cmd = f"tar -czf {shlex.quote(tar_local_path)} {shlex.quote(db_path)} {shlex.quote(index_path)} {shlex.quote(geometry_cache_path)}"
                 subprocess.run(["bash", "-lc", fallback_cmd], check=True)
                 logging.info(f"Created tarball with gzip fallback: {tar_local_path}")
 
