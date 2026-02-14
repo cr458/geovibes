@@ -12,6 +12,7 @@ import duckdb
 import faiss
 import geopandas as gpd
 
+from geovibes.database.faiss_cache import FaissCache
 from geovibes.ee_tools import initialize_ee_with_credentials
 from geovibes.ui_config import BasemapConfig, DatabaseConstants, GeoVibesConfig
 
@@ -27,12 +28,28 @@ from .utils import (
 class DataManager:
     """Encapsulates configuration, database, and FAISS operations."""
 
+    @staticmethod
+    def is_remote_url(path: str) -> bool:
+        """Check if a path is a remote URL (S3 or GCS).
+
+        Args:
+            path: File path or URL to check.
+
+        Returns:
+            True if the path is a remote URL (s3:// or gs://), False otherwise.
+        """
+        if not path:
+            return False
+        return path.startswith("s3://") or path.startswith("gs://")
+
     def __init__(
         self,
         *,
         start_date: Optional[str] = None,
         end_date: Optional[str] = None,
         duckdb_path: Optional[str] = None,
+        faiss_path: Optional[str] = None,
+        geometry_cache_path: Optional[str] = None,
         duckdb_directory: Optional[str] = None,
         config: Optional[Dict] = None,
         enable_ee: Optional[bool] = None,
@@ -41,11 +58,15 @@ class DataManager:
         baselayer_url: Optional[str] = None,
         disable_ee: bool = False,
         verbose: bool = False,
+        include_remote: bool = False,
         **unused_kwargs: Any,
     ) -> None:
         self.verbose = verbose
+        self.include_remote = include_remote
         self.baselayer_url = baselayer_url or BasemapConfig.BASEMAP_TILES["MAPTILER"]
         self.duckdb_path = duckdb_path
+        self.faiss_path = faiss_path
+        self.geometry_cache_path = geometry_cache_path
         self.duckdb_directory = duckdb_directory
 
         if "enable_ee" in unused_kwargs and self.verbose:
@@ -99,11 +120,56 @@ class DataManager:
             entry["db_path"]: entry for entry in self.available_databases
         }
 
-        self.current_database_info = self.available_databases[0]
-        self.current_database_path = self.current_database_info["db_path"]
-        self.current_faiss_path = self.current_database_info.get("faiss_path")
-        self.current_geometry_path = self.current_database_info.get("geometry_path")
-        self.tile_spec = self.current_database_info.get("tile_spec")
+        # Initialize connection state variables
+        self.current_database_info: Optional[Dict] = None
+        self.current_database_path: Optional[str] = None
+        self.current_faiss_path: Optional[str] = None
+        self.current_geometry_path: Optional[str] = None
+        self.current_geometry_cache_path: Optional[str] = None
+        self.tile_spec: Optional[Dict] = None
+        self.effective_boundary_path: Optional[str] = None
+        self.duckdb_connection: Optional[duckdb.DuckDBPyConnection] = None
+        self._owns_connection = False
+        self.faiss_index: Optional[faiss.Index] = None
+        self.embedding_dim: Optional[int] = None
+        self._geometry_cache_local_path: Optional[pathlib.Path] = None
+        self._geometry_cache_connection: Optional[duckdb.DuckDBPyConnection] = None
+        self.center_x: float = 0.0
+        self.center_y: float = 0.0
+
+        # Deferred loading: skip connection when include_remote=True
+        # User will select a database from dropdown, then we connect
+        if self.include_remote:
+            if self.verbose:
+                print("📋 Deferred loading enabled - select a database to connect")
+            return
+
+        # Immediate loading: connect to first database
+        first_db = self.available_databases[0]
+        self._connect_to_database_internal(first_db, duckdb_connection)
+
+    # ------------------------------------------------------------------
+    # Database connection
+    # ------------------------------------------------------------------
+
+    def connect_to_database(self, db_path: str) -> None:
+        """Connect to a database by path. Used for deferred loading."""
+        db_info = self.database_info_by_path.get(db_path)
+        if not db_info:
+            raise ValueError(f"Unknown database: {db_path}")
+        self._connect_to_database_internal(db_info, duckdb_connection=None)
+
+    def _connect_to_database_internal(
+        self,
+        db_info: Dict,
+        duckdb_connection: Optional[duckdb.DuckDBPyConnection] = None,
+    ) -> None:
+        """Internal method to connect to a database."""
+        self.current_database_info = db_info
+        self.current_database_path = db_info["db_path"]
+        self.current_faiss_path = db_info.get("faiss_path")
+        self.current_geometry_path = db_info.get("geometry_path")
+        self.tile_spec = db_info.get("tile_spec")
         if not self.tile_spec:
             self.tile_spec = infer_tile_spec_from_name(self.current_database_path)
         self.effective_boundary_path = None
@@ -124,21 +190,34 @@ class DataManager:
             raise ValueError("Could not find a FAISS index for the selected database.")
         if self.verbose:
             print(f"🧠 Loading FAISS index from: {self.current_faiss_path}")
-        self.faiss_index = faiss.read_index(self.current_faiss_path)
+        self.faiss_index = self._load_faiss_index(self.current_faiss_path)
         if self.verbose:
             print(f"✅ FAISS index loaded. Contains {self.faiss_index.ntotal} vectors.")
 
         # Detect embedding dimension
         self.embedding_dim = self._detect_embedding_dim()
 
-        # Warm up if needed
-        if DatabaseConstants.is_gcs_path(self.current_database_path):
-            self._warm_up_gcs_database()
+        # Load geometry cache for remote databases
+        self.current_geometry_cache_path = db_info.get("geometry_cache_path")
+        self._geometry_cache_local_path = None
+        self._geometry_cache_connection = None
+        if self.current_geometry_cache_path and self.is_remote_url(
+            self.current_database_path
+        ):
+            self._load_geometry_cache(self.current_geometry_cache_path)
+
+        # Warm up remote databases to preload row groups
+        if self.is_remote_url(self.current_database_path):
+            self._warm_up_remote_database()
 
         # Derive map centering data
         self.effective_boundary_path, (self.center_y, self.center_x) = (
             self._setup_boundary_and_center()
         )
+
+    def is_connected(self) -> bool:
+        """Check if a database is currently connected."""
+        return self.duckdb_connection is not None
 
     # ------------------------------------------------------------------
     # Configuration helpers
@@ -212,7 +291,7 @@ class DataManager:
 
         db_path = self.duckdb_path or getattr(self.config, "duckdb_path", None)
         if db_path:
-            faiss_path = self._infer_faiss_from_db(db_path)
+            faiss_path = self.faiss_path or self._infer_faiss_from_db(db_path)
             if not faiss_path:
                 if self.verbose:
                     print(f"⚠️  Could not locate FAISS index for {db_path}. Skipping.")
@@ -220,12 +299,17 @@ class DataManager:
                 geometry_path = self._infer_geometry_from_db(db_path)
                 if geometry_path is None:
                     geometry_path = getattr(self.config, "boundary_path", None)
+                geometry_cache = (
+                    self.geometry_cache_path
+                    or self._infer_geometry_cache_from_db(db_path)
+                )
                 discovered.append(
                     {
                         "db_path": db_path,
                         "faiss_path": faiss_path,
                         "display_name": os.path.basename(db_path),
                         "geometry_path": geometry_path,
+                        "geometry_cache_path": geometry_cache,
                     }
                 )
                 return discovered
@@ -278,7 +362,191 @@ class DataManager:
                 self.local_database_directory, self.manifest_entries
             )
         )
+
+        # Tier 4: Remote databases from S3
+        # Include if: (a) no local databases found, or (b) include_remote=True
+        if not discovered or self.include_remote:
+            try:
+                remote_dbs = self.discover_remote_databases()
+                if remote_dbs:
+                    if self.verbose:
+                        msg = "alongside local" if discovered else "no local found"
+                        print(f"📡 Found {len(remote_dbs)} remote databases ({msg})")
+                    discovered.extend(remote_dbs)
+            except Exception as e:
+                if self.verbose:
+                    print(f"⚠️  Could not list remote databases: {e}")
+
         return discovered
+
+    def discover_remote_databases(self, base_url: str = None) -> List[Dict[str, Any]]:
+        """Scan S3 for available remote databases in httpfs/ folders.
+
+        Recursively scans from base_url to find all httpfs/ folders containing
+        database files (metadata.db, faiss.index, geometry_cache.parquet).
+
+        Args:
+            base_url: S3 URL to start scanning from. Defaults to
+                DatabaseConstants.DEFAULT_SEARCH_BASE_URL.
+
+        Returns:
+            List of database entries compatible with available_databases format.
+            Each entry includes is_remote=True flag.
+        """
+        import boto3
+        from botocore import UNSIGNED
+        from botocore.config import Config
+
+        base_url = base_url or DatabaseConstants.DEFAULT_SEARCH_BASE_URL
+
+        # Parse S3 URL
+        if not base_url.startswith("s3://"):
+            return []
+
+        # Extract bucket and prefix from URL
+        url_parts = base_url[5:].split("/", 1)
+        bucket = url_parts[0]
+        prefix = url_parts[1] if len(url_parts) > 1 else ""
+
+        if self.verbose:
+            print(f"🔍 Scanning for remote databases at {base_url}")
+
+        # Create S3 client (anonymous access for public bucket)
+        s3 = boto3.client(
+            "s3",
+            config=Config(signature_version=UNSIGNED),
+        )
+
+        discovered = []
+
+        # List all objects under the prefix to find httpfs/ folders
+        paginator = s3.get_paginator("list_objects_v2")
+        httpfs_folders = set()
+
+        for page in paginator.paginate(Bucket=bucket, Prefix=prefix):
+            for obj in page.get("Contents", []):
+                key = obj["Key"]
+                # Look for httpfs/ in the path
+                if "/httpfs/" in key:
+                    # Extract the httpfs folder path (e.g., .../httpfs/model_name/)
+                    httpfs_idx = key.index("/httpfs/")
+                    after_httpfs = key[httpfs_idx + 8 :]  # Skip "/httpfs/"
+                    if "/" in after_httpfs:
+                        model_folder = after_httpfs.split("/")[0]
+                        folder_path = key[: httpfs_idx + 8] + model_folder
+                        httpfs_folders.add(folder_path)
+
+        if self.verbose:
+            print(f"   Found {len(httpfs_folders)} model folders")
+
+        # For each httpfs folder, check for required files
+        for folder_path in sorted(httpfs_folders):
+            folder_prefix = folder_path + "/"
+
+            # List files in this folder
+            response = s3.list_objects_v2(
+                Bucket=bucket, Prefix=folder_prefix, Delimiter="/"
+            )
+            files = {obj["Key"].split("/")[-1] for obj in response.get("Contents", [])}
+
+            # Check for required files
+            has_db = "metadata.db" in files
+            has_faiss = "faiss.index" in files
+            has_geometry = "geometry_cache.parquet" in files
+
+            if not (has_db and has_faiss):
+                if self.verbose:
+                    print(f"   ⚠️  Skipping {folder_path} (missing required files)")
+                continue
+
+            # Build URLs
+            model_name = folder_path.split("/")[-1]
+            db_url = f"s3://{bucket}/{folder_prefix}metadata.db"
+            faiss_url = f"s3://{bucket}/{folder_prefix}faiss.index"
+            geometry_url = (
+                f"s3://{bucket}/{folder_prefix}geometry_cache.parquet"
+                if has_geometry
+                else None
+            )
+
+            # Extract region and date range from path for display
+            # Path format: .../USA/alabama/2024-01-01-2025-01-01/httpfs/model_name
+            path_parts = folder_path.split("/")
+            region = None
+            date_range = None
+            for i, part in enumerate(path_parts):
+                if part == "httpfs" and i >= 2:
+                    region = path_parts[i - 2]  # e.g., "alabama"
+                    date_range = path_parts[i - 1]  # e.g., "2024-01-01-2025-01-01"
+                    break
+
+            # Build display name
+            display_name = self._build_remote_display_name(
+                model_name, region, date_range
+            )
+
+            # Parse tile spec from model name
+            tile_spec = infer_tile_spec_from_name(model_name)
+
+            # Build boundary URL from region
+            boundary_url = None
+            if region:
+                boundary_url = f"s3://{DatabaseConstants.SOURCE_COOP_BUCKET}/geovibes/geometries/{region}.geojson"
+
+            entry = {
+                "db_path": db_url,
+                "faiss_path": faiss_url,
+                "display_name": display_name,
+                "geometry_path": None,  # Remote DBs use geometry cache instead
+                "geometry_cache_path": geometry_url,
+                "boundary_url": boundary_url,
+                "tile_spec": tile_spec,
+                "is_remote": True,
+                "region": region,
+                "date_range": date_range,
+            }
+            discovered.append(entry)
+
+            if self.verbose:
+                print(f"   ✓ {display_name}")
+
+        return discovered
+
+    def _build_remote_display_name(
+        self, model_name: str, region: str = None, date_range: str = None
+    ) -> str:
+        """Build a human-readable display name for a remote database."""
+        # Extract model type from name
+        # e.g., "alabama_dino_vit_small_patch16_224_2024_2025_32_16_10"
+        # -> "DINO ViT (32px, 16px, 10m)"
+
+        # Parse tile spec for display
+        tile_spec = infer_tile_spec_from_name(model_name)
+        tile_info = ""
+        if tile_spec:
+            tile_info = f" ({tile_spec.get('tile_size_px', '?')}px)"
+
+        # Simplify model name for display
+        name_lower = model_name.lower()
+        if "dino_vit" in name_lower:
+            if "quantized" in name_lower:
+                model_type = "Quantized DINO ViT"
+            else:
+                model_type = "DINO ViT"
+        elif "earthgenome" in name_lower or "softcon" in name_lower:
+            model_type = "EarthGenome"
+        elif "google_satellite" in name_lower:
+            model_type = "Google Satellite"
+        else:
+            # Fallback: use first part of model name
+            model_type = model_name.split("_")[0].title()
+
+        # Build final display name
+        parts = [model_type + tile_info]
+        if region:
+            parts.append(region.replace("_", " ").title())
+
+        return " - ".join(parts)
 
     def _infer_faiss_from_db(self, db_path: str) -> Optional[str]:
         candidate = pathlib.Path(db_path)
@@ -328,6 +596,28 @@ class DataManager:
             geometry_path = self._resolve_geometry_path(candidate)
             if geometry_path:
                 return geometry_path
+        return None
+
+    def _infer_geometry_cache_from_db(self, db_path: str) -> Optional[str]:
+        """Infer the geometry cache Parquet URL from the database path.
+
+        For S3/GCS URLs, constructs the cache URL by replacing _metadata.db or .db
+        with _geometry_cache.parquet. For local paths, returns None (no cache needed).
+        """
+        if not db_path:
+            return None
+
+        # Only infer for remote databases
+        if not self.is_remote_url(db_path):
+            return None
+
+        # Construct geometry cache URL from database URL
+        # e.g., s3://bucket/path/name_metadata.db -> s3://bucket/path/name_geometry_cache.parquet
+        if db_path.endswith("_metadata.db"):
+            return db_path.replace("_metadata.db", "_geometry_cache.parquet")
+        elif db_path.endswith(".db"):
+            return db_path.replace(".db", "_geometry_cache.parquet")
+
         return None
 
     # ------------------------------------------------------------------
@@ -521,6 +811,9 @@ class DataManager:
                 print("🔑 Using HMAC key authentication")
             else:
                 print("🔑 Using default Google Cloud authentication")
+        elif DatabaseConstants.is_s3_path(database_path) and self.verbose:
+            print(f"🌐 Connecting to S3 database: {database_path}")
+            print("🔑 Using AWS credentials from environment/config")
         elif self.verbose:
             print(f"💾 Connecting to local database: {database_path}")
 
@@ -541,6 +834,15 @@ class DataManager:
                     error_msg += (
                         "\n💡 Check your GCS authentication setup (see GCS_SETUP.md)"
                     )
+                raise RuntimeError(error_msg)
+            elif DatabaseConstants.is_s3_path(database_path):
+                error_msg = f"Failed to connect to S3 database: {exc}"
+                if (
+                    "authentication" in str(exc).lower()
+                    or "forbidden" in str(exc).lower()
+                    or "403" in str(exc)
+                ):
+                    error_msg += "\n💡 Check your AWS credentials (aws configure or environment variables)"
                 raise RuntimeError(error_msg)
             raise RuntimeError(f"Failed to connect to local database: {exc}")
 
@@ -608,31 +910,41 @@ class DataManager:
                 print("⚠️ Using default dimension of 384")
             return 384
 
-    def _warm_up_gcs_database(self) -> None:
+    def _warm_up_remote_database(self) -> None:
+        """Warm up remote database by preloading row groups.
+
+        For httpfs databases, the first query to each row group is slow (~500ms).
+        This method preloads data by:
+        1. Running a spatial nearest-point query (used when labeling points)
+        2. Fetching an embedding (used when updating the query vector)
+
+        This ensures the first user interaction is fast.
+        """
+        import time
+
         try:
-            if self.verbose:
-                print("🔧 Optimizing database connection...")
+            print("🔄 Warming up remote database (this may take a moment)...")
+            start = time.perf_counter()
 
-            first_point_query = """
-            SELECT CAST(embedding AS FLOAT[]) as embedding 
-            FROM geo_embeddings 
-            WHERE embedding IS NOT NULL 
-            LIMIT 1
-            """
-            result = self.duckdb_connection.execute(first_point_query).fetchone()
-            if not result or not result[0]:
-                if self.verbose:
-                    print("⚠️  No embeddings found for warm-up")
-                return
+            # Get database centroid for warmup queries
+            centroid = self.duckdb_connection.execute(
+                "SELECT AVG(ST_X(geometry)), AVG(ST_Y(geometry)) FROM geo_embeddings LIMIT 10000"
+            ).fetchone()
+            center_lon, center_lat = centroid if centroid else (0, 0)
 
-            first_embedding = result[0]
-            sql = DatabaseConstants.get_similarity_search_light_query(
-                self.embedding_dim
-            )
-            query_params = [first_embedding, 100]
-            self.duckdb_connection.execute(sql, query_params).fetchall()
-            if self.verbose:
-                print("✅ Database optimization completed")
+            # Warm up the nearest_point query (spatial scan + embedding fetch)
+            # This is the query that runs when user clicks to label a point
+            print("   Loading spatial index...", end="", flush=True)
+            spatial_start = time.perf_counter()
+            self.duckdb_connection.execute(
+                DatabaseConstants.NEAREST_POINT_QUERY, [center_lon, center_lat]
+            ).fetchone()
+            spatial_time = time.perf_counter() - spatial_start
+            print(f" done ({spatial_time:.1f}s)")
+
+            elapsed = time.perf_counter() - start
+            print(f"✅ Database ready ({elapsed:.1f}s)")
+
         except Exception as exc:
             if self.verbose:
                 print(f"⚠️  Database warm-up failed: {exc}")
@@ -649,6 +961,16 @@ class DataManager:
             and self.current_database_info.get("geometry_path")
         ):
             boundary_path = self.current_database_info.get("geometry_path")
+
+        # For remote databases, fetch boundary from S3 if available
+        if (
+            not boundary_path
+            and self.current_database_info
+            and self.current_database_info.get("boundary_url")
+        ):
+            boundary_path = self._fetch_remote_boundary(
+                self.current_database_info["boundary_url"]
+            )
 
         if boundary_path:
             try:
@@ -670,6 +992,98 @@ class DataManager:
         )
         return None, (center_y, center_x)
 
+    def _fetch_remote_boundary(self, boundary_url: str) -> Optional[str]:
+        """Fetch and cache a remote boundary GeoJSON file."""
+        import hashlib
+
+        import fsspec
+
+        # Create cache directory
+        cache_dir = pathlib.Path.home() / ".cache" / "geovibes" / "boundaries"
+        cache_dir.mkdir(parents=True, exist_ok=True)
+
+        # Generate cache filename from URL hash
+        url_hash = hashlib.md5(boundary_url.encode()).hexdigest()[:16]
+        # Extract filename from URL for readability
+        url_filename = boundary_url.split("/")[-1]
+        cache_path = cache_dir / f"{url_hash}_{url_filename}"
+
+        if cache_path.exists():
+            if self.verbose:
+                print(f"📍 Using cached boundary: {cache_path}")
+            return str(cache_path)
+
+        if self.verbose:
+            print(f"📥 Downloading boundary from {boundary_url}...")
+
+        try:
+            # Use fsspec to handle S3 URLs
+            with fsspec.open(boundary_url, "rb", anon=True) as f:
+                content = f.read()
+            cache_path.write_bytes(content)
+            if self.verbose:
+                print(f"📍 Cached boundary to: {cache_path}")
+            return str(cache_path)
+        except Exception as exc:
+            if self.verbose:
+                print(f"⚠️  Could not fetch boundary from {boundary_url}: {exc}")
+            return None
+
+    def _load_faiss_index(self, faiss_path: str) -> faiss.Index:
+        """Load FAISS index from local path or S3 URL.
+
+        For S3 URLs, uses FaissCache to download and cache the index locally.
+
+        Args:
+            faiss_path: Local path or S3 URL to FAISS index
+
+        Returns:
+            Loaded FAISS index
+        """
+        if DatabaseConstants.is_s3_path(faiss_path):
+            if self.verbose:
+                print("📥 Downloading FAISS index from S3 (with caching)...")
+            cache = FaissCache()
+            return cache.get_index(faiss_path, show_progress=True)
+        else:
+            return faiss.read_index(faiss_path)
+
+    def _load_geometry_cache(self, geometry_cache_url: str) -> None:
+        """Download and connect to geometry cache for fast metadata queries.
+
+        For remote databases, the geometry cache is a small Parquet file containing
+        just id + geometry columns. This enables fast local queries instead of
+        fetching scattered IDs over httpfs.
+
+        Args:
+            geometry_cache_url: S3 or GCS URL to the geometry cache Parquet file
+        """
+        if self.verbose:
+            print("📥 Downloading geometry cache (with caching)...")
+
+        cache = FaissCache()
+        local_path = cache.get_geometry_cache(geometry_cache_url, show_progress=True)
+        self._geometry_cache_local_path = local_path
+
+        if self.verbose:
+            print(f"🗺️  Connecting to geometry cache: {local_path}")
+
+        # Create a separate DuckDB connection for geometry queries
+        self._geometry_cache_connection = duckdb.connect(":memory:")
+        self._geometry_cache_connection.execute("INSTALL spatial; LOAD spatial;")
+
+        # Create a view to query the Parquet file
+        self._geometry_cache_connection.execute(
+            f"CREATE VIEW geometry_cache AS SELECT * FROM '{local_path}'"
+        )
+
+        row_count = self._geometry_cache_connection.execute(
+            "SELECT COUNT(*) FROM geometry_cache"
+        ).fetchone()[0]
+
+        if self.verbose:
+            print(f"✅ Geometry cache ready ({row_count:,} geometries)")
+
     # ------------------------------------------------------------------
     # Public API
     # ------------------------------------------------------------------
@@ -680,6 +1094,15 @@ class DataManager:
                 self.duckdb_connection.close()
                 if self.verbose:
                     print("🔌 DuckDB connection closed.")
+        if getattr(self, "_geometry_cache_connection", None):
+            self._geometry_cache_connection.close()
+            self._geometry_cache_connection = None
+
+    def create_background_connection(self) -> Optional[duckdb.DuckDBPyConnection]:
+        """Create a separate connection for background operations."""
+        if not self.current_database_path:
+            return None
+        return self._connect_duckdb(self.current_database_path)
 
     def fetch_embeddings(self, point_ids: List[str], chunk_size: Optional[int] = None):
         if not point_ids:
@@ -706,7 +1129,7 @@ class DataManager:
             select_clause = ", ".join(select_parts)
             query = f"""
             SELECT {select_clause}
-            FROM geo_embeddings 
+            FROM geo_embeddings
             WHERE id IN ({placeholders})
             """
             log_to_file(
@@ -718,10 +1141,62 @@ class DataManager:
             chunk_df = arrow_table.to_pandas()
             yield chunk_df
 
+    def fetch_embeddings_with_connection(
+        self,
+        connection: duckdb.DuckDBPyConnection,
+        point_ids: List[str],
+        chunk_size: Optional[int] = None,
+    ):
+        """Fetch embeddings using a specific connection (for background operations)."""
+        if not point_ids:
+            return
+
+        chunk_size = chunk_size or DatabaseConstants.EMBEDDING_CHUNK_SIZE
+
+        for i in range(0, len(point_ids), chunk_size):
+            chunk = point_ids[i : i + chunk_size]
+            prepared_chunk = prepare_ids_for_query(chunk)
+            placeholders = ",".join(["?" for _ in prepared_chunk])
+            select_parts = ["id"]
+            external_column = getattr(self, "external_id_column", "id")
+            if external_column != "id":
+                select_parts.append(external_column)
+            select_parts.extend(
+                [
+                    "CAST(embedding AS FLOAT[]) as embedding",
+                    "geometry",
+                ]
+            )
+            select_clause = ", ".join(select_parts)
+            query = f"""
+            SELECT {select_clause}
+            FROM geo_embeddings
+            WHERE id IN ({placeholders})
+            """
+            arrow_table = connection.execute(query, prepared_chunk).fetch_arrow_table()
+            chunk_df = arrow_table.to_pandas()
+            yield chunk_df
+
     def nearest_point(self, lon: float, lat: float):
+        import time
+
+        log_to_file(f"nearest_point: START (lon={lon:.4f}, lat={lat:.4f})")
         sql = DatabaseConstants.NEAREST_POINT_QUERY
         params = [lon, lat]
-        return self.duckdb_connection.execute(sql, params).fetchone()
+
+        exec_start = time.perf_counter()
+        cursor = self.duckdb_connection.execute(sql, params)
+        exec_time = (time.perf_counter() - exec_start) * 1000
+        log_to_file(f"nearest_point: execute() completed in {exec_time:.1f}ms")
+
+        fetch_start = time.perf_counter()
+        result = cursor.fetchone()
+        fetch_time = (time.perf_counter() - fetch_start) * 1000
+        log_to_file(f"nearest_point: fetchone() completed in {fetch_time:.1f}ms")
+
+        total_time = exec_time + fetch_time
+        log_to_file(f"nearest_point: DONE total={total_time:.1f}ms")
+        return result
 
     def query_geometries(self, ids: List[str]):
         if not ids:
@@ -739,6 +1214,19 @@ class DataManager:
         if not faiss_ids:
             return None
         placeholders = ",".join(["?" for _ in faiss_ids])
+
+        # Use local geometry cache for remote databases (much faster)
+        if self._geometry_cache_connection is not None:
+            sql = f"""
+            SELECT id,
+                   ST_AsGeoJSON(geometry) AS geometry_json,
+                   ST_AsText(geometry) AS geometry_wkt
+            FROM geometry_cache
+            WHERE id IN ({placeholders})
+            """
+            return self._geometry_cache_connection.execute(sql, faiss_ids).fetchdf()
+
+        # Fall back to remote database query
         select_parts = ["id"]
         external_column = getattr(self, "external_id_column", "id")
         if external_column != "id":
@@ -789,10 +1277,12 @@ class DataManager:
                 f"No FAISS index recorded for {os.path.basename(database_path)}"
             )
 
-        self.faiss_index = faiss.read_index(self.current_faiss_path)
+        self.faiss_index = self._load_faiss_index(self.current_faiss_path)
         self.embedding_dim = self._detect_embedding_dim()
-        if DatabaseConstants.is_gcs_path(database_path):
-            self._warm_up_gcs_database()
+        if DatabaseConstants.is_gcs_path(database_path) or DatabaseConstants.is_s3_path(
+            database_path
+        ):
+            self._warm_up_remote_database()
 
         self.effective_boundary_path, (self.center_y, self.center_x) = (
             self._setup_boundary_and_center()
